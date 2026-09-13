@@ -1,0 +1,2596 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Bank Heist Escape Room</title>
+
+    <!-- Fonts (same as the original app) -->
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;600;700&family=Inter:wght@300;400;500;600;700&display=swap"
+    />
+
+    <!-- Tailwind (JIT via CDN) — lets us reuse the original utility class names verbatim -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <!-- Lucide icons (used the same way the original app used lucide-react) -->
+    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+
+    <style>
+      :root {
+        --font-serif: "Cinzel", serif;
+        --font-sans: "Inter", sans-serif;
+      }
+      html,
+      body {
+        background-color: #030712;
+        font-family: var(--font-sans);
+      }
+      .font-serif {
+        font-family: var(--font-serif);
+      }
+      .bg-gradient-radial {
+        background-image: radial-gradient(var(--tw-gradient-stops));
+      }
+      @keyframes pulse {
+        0%,
+        100% {
+          opacity: 1;
+        }
+        50% {
+          opacity: 0.5;
+        }
+      }
+      .animate-pulse {
+        animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+      }
+    </style>
+  </head>
+  <body class="min-h-screen bg-gray-950 text-gray-100">
+    <div id="root" class="min-h-screen bg-gray-950 text-gray-100">
+      <div id="chrome"></div>
+      <div id="screen"></div>
+    </div>
+
+    <script>
+/* ==========================================================================
+   Bank Heist Escape Room — vanilla JS port of the original React app.
+   Everything below mirrors src/lib/gameContext.tsx, src/components/*,
+   and src/screens/*.tsx exactly (same puzzle answers, same flow).
+   ========================================================================== */
+"use strict";
+
+/* ---------------------------------------------------------------------
+ * Utilities
+ * ------------------------------------------------------------------- */
+function caesarDecode(text, shift) {
+  return text
+    .split("")
+    .map((c) => {
+      const code = c.charCodeAt(0);
+      if (code >= 65 && code <= 90) {
+        return String.fromCharCode(((code - 65 - shift + 26) % 26) + 65);
+      }
+      return c;
+    })
+    .join("");
+}
+
+function formatTime(seconds) {
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return `${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
+}
+
+function icon(name, cls) {
+  // Renders a lucide icon via <i data-lucide="..."> which lucide.createIcons() hydrates.
+  return `<i data-lucide="${name}" class="${cls || ""}"></i>`;
+}
+
+function refreshIcons() {
+  if (window.lucide && typeof window.lucide.createIcons === "function") {
+    window.lucide.createIcons();
+  }
+}
+
+function escapeHtml(str) {
+  const div = document.createElement("div");
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+/* ---------------------------------------------------------------------
+ * Puzzle configuration (verbatim from the original screens)
+ * ------------------------------------------------------------------- */
+const LOBBY_CONFIG = {
+  STICKY_CIPHER: "FRPPHQW",
+  STICKY_SHIFT: 3,
+  ENCODED_SAFE_DIGITS: "4068",
+  SAFE_CODE: "7391",
+};
+LOBBY_CONFIG.COMPUTER_PASSWORD = caesarDecode(
+  LOBBY_CONFIG.STICKY_CIPHER,
+  LOBBY_CONFIG.STICKY_SHIFT
+); // "COMMENT"
+
+const OFFICE_CONFIG = {
+  CIPHER_TEXT: "ZVPD",
+  CIPHER_SHIFT: 3,
+  CIPHER_ANSWER: "WSMA",
+  MATH_ANSWER: "1369",
+};
+
+const HALLWAY_CONFIG = {
+  SOLUTION_X: 2,
+  SOLUTION_Y: 3,
+  CORRECT_TILE: { row: 3, col: 2 },
+  CORRECT_DOOR: 5,
+};
+
+const SAFE_CONFIG = {
+  GRID_SIZE: 6,
+  CORRECT_PATH: [
+    "right",
+    "right",
+    "down",
+    "right",
+    "down",
+    "down",
+    "right",
+    "down",
+    "right",
+  ],
+  VAULT_CODE: "7534",
+  ALARM_ANSWER: "4",
+  OVERRIDE_ANSWER: "2",
+};
+
+const VAULT_CONFIG = {
+  CORRECT_ORDER: [6, 3, 5, 4, 1],
+  SYMBOLS: [
+    { id: "hexagon", value: 6, iconName: "hexagon", name: "Hexagon", sides: "6 sides" },
+    { id: "triangle", value: 3, iconName: "triangle", name: "Triangle", sides: "3 sides" },
+    { id: "star", value: 5, iconName: "star", name: "Star", sides: "5 points" },
+    { id: "square", value: 4, iconName: "square", name: "Square", sides: "4 sides" },
+    { id: "circle", value: 1, iconName: "circle", name: "Circle", sides: "1 (unity)" },
+  ],
+  CLUES: [
+    "The triangle (3) comes before the square (4).",
+    "The star (5) is in the middle position.",
+    "The circle (1) comes last.",
+    "The hexagon (6) comes first.",
+    "The star (5) comes before the square (4).",
+  ],
+};
+
+const LEADERBOARD_PASSWORD = "heistmaster";
+
+/* ---------------------------------------------------------------------
+ * Game context (mirrors src/lib/gameContext.tsx)
+ * ------------------------------------------------------------------- */
+const defaultCompleted = {
+  lobby: false,
+  office: false,
+  hallway: false,
+  safe: false,
+  vault: false,
+};
+
+const Game = {
+  screen: "start",
+  startTime: null,
+  endTime: null,
+  clues: {},
+  completedRooms: { ...defaultCompleted },
+
+  startGame() {
+    this.startTime = Date.now();
+    this.endTime = null;
+    this.clues = {};
+    this.completedRooms = { ...defaultCompleted };
+    this.goTo("lobby");
+  },
+
+  goTo(screen) {
+    // Clean up whatever room we're leaving (clears intervals/timeouts).
+    if (typeof Router.currentUnmount === "function") {
+      Router.currentUnmount();
+      Router.currentUnmount = null;
+    }
+    this.screen = screen;
+    Router.render();
+  },
+
+  addClue(clue) {
+    this.clues = { ...this.clues, [clue.room]: clue };
+    ClueBanner.render();
+  },
+
+  completeRoom(room) {
+    this.completedRooms = { ...this.completedRooms, [room]: true };
+  },
+
+  finishGame() {
+    this.endTime = Date.now();
+    this.goTo("victory");
+  },
+
+  resetGame() {
+    if (typeof Router.currentUnmount === "function") {
+      Router.currentUnmount();
+      Router.currentUnmount = null;
+    }
+    this.screen = "start";
+    this.startTime = null;
+    this.endTime = null;
+    this.clues = {};
+    this.completedRooms = { ...defaultCompleted };
+    Router.render();
+  },
+
+  getElapsedSeconds() {
+    if (!this.startTime) return 0;
+    const end = this.endTime ?? Date.now();
+    return Math.floor((end - this.startTime) / 1000);
+  },
+};
+
+/* ---------------------------------------------------------------------
+ * Timer (mirrors src/components/Timer.tsx)
+ * ------------------------------------------------------------------- */
+const Timer = {
+  intervalId: null,
+
+  render() {
+    const container = document.getElementById("timer-slot");
+    if (!container) return;
+
+    if (!Game.startTime) {
+      container.innerHTML = "";
+      this.stopLoop();
+      return;
+    }
+
+    const end = Game.endTime ?? Date.now();
+    const seconds = Math.floor((end - Game.startTime) / 1000);
+
+    container.innerHTML = `
+      <div class="fixed top-4 right-4 z-50 flex items-center gap-2 rounded-lg border border-amber-500/40 bg-gray-900/90 px-4 py-2 font-mono text-amber-400 shadow-lg backdrop-blur-sm">
+        ${icon("clock", "h-4 w-4")}
+        <span class="text-lg font-bold tabular-nums tracking-wider">${formatTime(seconds)}</span>
+      </div>
+    `;
+    refreshIcons();
+
+    if (!Game.endTime) {
+      this.startLoop();
+    } else {
+      this.stopLoop();
+    }
+  },
+
+  startLoop() {
+    if (this.intervalId) return;
+    this.intervalId = setInterval(() => this.render(), 1000);
+  },
+
+  stopLoop() {
+    if (this.intervalId) {
+      clearInterval(this.intervalId);
+      this.intervalId = null;
+    }
+  },
+};
+
+/* ---------------------------------------------------------------------
+ * Clue banner (mirrors src/components/ClueBanner.tsx)
+ * ------------------------------------------------------------------- */
+const ClueBanner = {
+  render() {
+    const container = document.getElementById("clue-banner-slot");
+    if (!container) return;
+
+    const collected = Object.values(Game.clues);
+    if (collected.length === 0) {
+      container.innerHTML = "";
+      return;
+    }
+
+    container.innerHTML = `
+      <div class="fixed bottom-4 left-4 z-50 max-w-xs">
+        <div class="rounded-lg border border-amber-500/30 bg-gray-900/90 p-3 shadow-lg backdrop-blur-sm">
+          <div class="mb-2 flex items-center gap-2 text-xs font-bold uppercase tracking-wide text-amber-400">
+            ${icon("lightbulb", "h-3 w-3")}
+            Clues Collected (${collected.length})
+          </div>
+          <div class="space-y-1">
+            ${collected
+              .map(
+                (clue) => `
+              <div class="text-xs text-gray-300">
+                <span class="font-semibold text-gray-200">${escapeHtml(clue.label)}:</span>
+                <span class="font-mono text-amber-300">${escapeHtml(clue.value)}</span>
+              </div>`
+              )
+              .join("")}
+          </div>
+        </div>
+      </div>
+    `;
+    refreshIcons();
+  },
+};
+
+/* ---------------------------------------------------------------------
+ * Shared UI helpers: RoomHeader, RoomBackground, Modal, PinInput
+ * ------------------------------------------------------------------- */
+function RoomHeader({ title, subtitle }) {
+  return `
+    <div class="mb-6 flex items-start justify-between">
+      <div>
+        <div class="flex items-center gap-3">
+          <h1 class="font-serif text-3xl font-bold text-amber-400">${escapeHtml(title)}</h1>
+        </div>
+        ${subtitle ? `<p class="mt-1 text-sm text-gray-400">${escapeHtml(subtitle)}</p>` : ""}
+      </div>
+    </div>
+  `;
+}
+
+function RoomBackground({ image, overlay }) {
+  const ov = overlay || "from-gray-950/95 via-gray-950/80 to-gray-950/95";
+  return `
+    <div class="pointer-events-none absolute inset-0 overflow-hidden">
+      <img src="${image}" alt="" class="h-full w-full object-cover" />
+      <div class="absolute inset-0 bg-gradient-to-b ${ov}"></div>
+    </div>
+  `;
+}
+
+// Generic modal wrapper. `onCloseExpr` is a JS expression string invoked via onclick.
+function Modal({ open, onCloseExpr, title, bodyHtml, maxWidth, zIndex }) {
+  if (!open) return "";
+  const mw = maxWidth || "max-w-lg";
+  const z = zIndex || 60;
+  return `
+    <div class="fixed inset-0 z-[${z}] flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm" onclick="${onCloseExpr}">
+      <div class="relative w-full ${mw} rounded-2xl border border-amber-500/30 bg-gray-900 p-6 shadow-2xl" onclick="event.stopPropagation()">
+        <button onclick="${onCloseExpr}" class="absolute right-4 top-4 text-gray-500 transition-colors hover:text-amber-400">
+          ${icon("x", "h-5 w-5")}
+        </button>
+        ${title ? `<h2 class="mb-4 font-serif text-xl font-bold text-amber-400">${escapeHtml(title)}</h2>` : ""}
+        ${bodyHtml}
+      </div>
+    </div>
+  `;
+}
+
+// PinInput: renders a length-N pin pad. `ns` = unique namespace string used to
+// scope the DOM ids/handlers for this particular pin input instance.
+// `onSubmitExpr(valueVar)` returns a JS expression string that receives the
+// current value from a global holder we create under window.__pin[ns].
+function PinInput({ ns, length, hint, onSubmit, digitFeedbackFn }) {
+  window.__pin = window.__pin || {};
+  window.__pin[ns] = window.__pin[ns] || { value: "" };
+  window.__pinSubmit = window.__pinSubmit || {};
+  window.__pinSubmit[ns] = onSubmit;
+  window.__pinFeedback = window.__pinFeedback || {};
+  if (digitFeedbackFn) window.__pinFeedback[ns] = digitFeedbackFn;
+
+  const value = window.__pin[ns].value;
+
+  const digits = Array.from({ length }).map((_, i) => {
+    const digit = value[i] ?? "";
+    let feedback = null;
+    if (digit && window.__pinFeedback[ns]) {
+      feedback = window.__pinFeedback[ns](digit, i);
+    }
+    let cls =
+      "flex h-14 w-12 items-center justify-center rounded-lg border-2 font-mono text-2xl font-bold transition-all ";
+    if (feedback === "correct") {
+      cls += "border-green-500 bg-green-500/20 text-green-400";
+    } else if (feedback === "wrong") {
+      cls += "border-red-500 bg-red-500/20 text-red-400";
+    } else if (digit) {
+      cls += "border-amber-500 bg-amber-500/10 text-amber-400";
+    } else {
+      cls += "border-gray-700 bg-gray-800 text-gray-600";
+    }
+    return `<div class="${cls}">${digit || "&bull;"}</div>`;
+  });
+
+  const keys = ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
+    .map(
+      (n) => `
+      <button onclick="PinInputHandlers.key('${ns}', '${n}')" class="h-12 w-12 rounded-lg border border-gray-700 bg-gray-800 font-mono text-lg font-bold text-gray-200 transition-all hover:border-amber-500 hover:bg-amber-500/10 hover:text-amber-400 active:scale-95">${n}</button>
+    `
+    )
+    .join("");
+
+  return `
+    <div class="flex flex-col items-center gap-4">
+      ${hint ? `<p class="text-center text-sm text-gray-400">${escapeHtml(hint)}</p>` : ""}
+      <div class="flex gap-2">${digits.join("")}</div>
+      <div class="grid grid-cols-3 gap-2">
+        ${keys}
+        <button onclick="PinInputHandlers.key('${ns}', 'del')" class="h-12 w-12 rounded-lg border border-gray-700 bg-gray-800 text-gray-400 transition-all hover:border-red-500 hover:text-red-400 active:scale-95">
+          ${icon("delete", "mx-auto h-5 w-5")}
+        </button>
+        <button onclick="PinInputHandlers.key('${ns}', '0')" class="h-12 w-12 rounded-lg border border-gray-700 bg-gray-800 font-mono text-lg font-bold text-gray-200 transition-all hover:border-amber-500 hover:bg-amber-500/10 hover:text-amber-400 active:scale-95">0</button>
+        <button onclick="PinInputHandlers.key('${ns}', 'enter')" class="h-12 w-12 rounded-lg border border-amber-500 bg-amber-500/20 font-bold text-amber-400 transition-all hover:bg-amber-500/30 active:scale-95">OK</button>
+      </div>
+    </div>
+  `;
+}
+
+const PinInputHandlers = {
+  key(ns, key) {
+    const holder = window.__pin[ns];
+    if (key === "del") {
+      holder.value = holder.value.slice(0, -1);
+    } else if (key === "enter") {
+      const submit = window.__pinSubmit[ns];
+      const val = holder.value;
+      holder.value = "";
+      if (submit) submit(val);
+      return;
+    } else {
+      // length is enforced by caller re-rendering; just cap at 6 defensively
+      if (holder.value.length < 6) holder.value += key;
+    }
+    // Re-render whichever room owns this namespace.
+    if (window.__pinRerender && window.__pinRerender[ns]) {
+      window.__pinRerender[ns]();
+    }
+  },
+};
+
+/* ---------------------------------------------------------------------
+ * Router (mirrors GameRouter in src/App.tsx)
+ * ------------------------------------------------------------------- */
+const Router = {
+  currentUnmount: null,
+
+  render() {
+    const showChrome = Game.screen !== "start" && Game.screen !== "leaderboard";
+    const chrome = document.getElementById("chrome");
+    chrome.innerHTML = showChrome
+      ? `<div id="timer-slot"></div><div id="clue-banner-slot"></div>`
+      : "";
+    if (showChrome) {
+      Timer.render();
+      ClueBanner.render();
+    } else {
+      Timer.stopLoop();
+    }
+
+    const screenEl = document.getElementById("screen");
+    screenEl.innerHTML = "";
+
+    switch (Game.screen) {
+      case "start":
+        this.currentUnmount = StartScreen.mount(screenEl);
+        break;
+      case "lobby":
+        this.currentUnmount = LobbyRoom.mount(screenEl);
+        break;
+      case "office":
+        this.currentUnmount = OfficeRoom.mount(screenEl);
+        break;
+      case "hallway":
+        this.currentUnmount = HallwayRoom.mount(screenEl);
+        break;
+      case "safe":
+        this.currentUnmount = SafeRoom.mount(screenEl);
+        break;
+      case "vault":
+        this.currentUnmount = VaultRoom.mount(screenEl);
+        break;
+      case "victory":
+        this.currentUnmount = VictoryScreen.mount(screenEl);
+        break;
+      case "leaderboard":
+        this.currentUnmount = LeaderboardScreen.mount(screenEl);
+        break;
+      default:
+        screenEl.innerHTML = "";
+    }
+  },
+};
+
+/* ---------------------------------------------------------------------
+ * StartScreen (mirrors src/screens/StartScreen.tsx)
+ * ------------------------------------------------------------------- */
+const StartScreen = {
+  state: { showLeaderboard: false, password: "", error: false },
+
+  mount(container) {
+    this.state = { showLeaderboard: false, password: "", error: false };
+    this.container = container;
+    this.render();
+    return () => {};
+  },
+
+  render() {
+    const s = this.state;
+    this.container.innerHTML = `
+      <div class="relative min-h-screen overflow-hidden bg-gray-950">
+        <div class="pointer-events-none absolute inset-0 overflow-hidden">
+          <img src="https://images.pexels.com/photos/19882101/pexels-photo-19882101.jpeg?auto=compress&cs=tinysrgb&h=650&w=940" alt="" class="h-full w-full object-cover opacity-30" />
+          <div class="absolute inset-0 bg-gradient-to-b from-gray-950/90 via-gray-950/70 to-gray-950"></div>
+        </div>
+        <div class="pointer-events-none absolute left-1/2 top-1/2 h-[600px] w-[600px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-amber-500/10 blur-[120px]"></div>
+
+        <div class="relative z-10 flex min-h-screen flex-col items-center justify-center px-4">
+          <div class="mb-8 animate-pulse">
+            <div class="flex h-24 w-24 items-center justify-center rounded-full border-2 border-amber-500/40 bg-gray-900 shadow-[0_0_40px_rgba(245,158,11,0.2)]">
+              ${icon("shield", "h-12 w-12 text-amber-500")}
+            </div>
+          </div>
+
+          <h1 class="font-serif text-5xl font-bold tracking-tight text-amber-400 sm:text-7xl">THE HEIST</h1>
+          <p class="mt-2 text-sm uppercase tracking-[0.3em] text-gray-500">A Mathematical Escape Room</p>
+
+          <p class="mt-8 max-w-md text-center text-gray-400">
+            Infiltrate the vault through five rooms of puzzles. Decode ciphers,
+            solve equations, navigate laser mazes, and crack the final code.
+            How fast can you escape?
+          </p>
+
+          <div class="mt-10 flex flex-col gap-4 sm:flex-row">
+            <button onclick="Game.startGame()" class="group flex items-center gap-3 rounded-xl border border-amber-500 bg-amber-500/10 px-8 py-4 font-bold text-amber-400 transition-all hover:bg-amber-500 hover:text-gray-950 hover:shadow-[0_0_30px_rgba(245,158,11,0.4)]">
+              ${icon("play", "h-5 w-5 transition-transform group-hover:scale-110")}
+              Begin the Heist
+            </button>
+            <button onclick="StartScreen.openLeaderboardModal()" class="flex items-center gap-3 rounded-xl border border-gray-700 bg-gray-800 px-8 py-4 font-bold text-gray-300 transition-all hover:border-amber-500 hover:text-amber-400">
+              ${icon("trophy", "h-5 w-5")}
+              Leaderboard
+            </button>
+          </div>
+
+          <div class="mt-12 flex gap-6 text-xs text-gray-600">
+            <span>5 Rooms</span>
+            <span>&bull;</span>
+            <span>Timed</span>
+            <span>&bull;</span>
+            <span>Math Puzzles</span>
+          </div>
+        </div>
+
+        ${
+          s.showLeaderboard
+            ? `
+        <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm">
+          <div class="w-full max-w-sm rounded-2xl border border-amber-500/30 bg-gray-900 p-6 shadow-2xl">
+            <div class="mb-4 flex items-center gap-3">
+              ${icon("lock", "h-5 w-5 text-amber-400")}
+              <h2 class="font-serif text-xl font-bold text-amber-400">Master Access</h2>
+            </div>
+            <p class="mb-4 text-sm text-gray-400">Enter the master password to view the leaderboard.</p>
+            <input
+              id="leaderboard-password-input"
+              type="password"
+              value="${escapeHtml(s.password)}"
+              oninput="StartScreen.onPasswordInput(this.value)"
+              onkeydown="if(event.key==='Enter'){StartScreen.handleLeaderboardAccess();}"
+              placeholder="Password"
+              class="w-full rounded-lg border ${s.error ? "border-red-500" : "border-gray-700 focus:border-amber-500"} bg-gray-800 px-4 py-3 text-gray-200 outline-none transition-colors"
+            />
+            ${s.error ? `<p class="mt-2 text-sm text-red-400">Incorrect password. Try again.</p>` : ""}
+            <div class="mt-4 flex gap-3">
+              <button onclick="StartScreen.closeLeaderboardModal()" class="flex-1 rounded-lg border border-gray-700 bg-gray-800 px-4 py-2 text-gray-400 transition-colors hover:text-gray-200">Cancel</button>
+              <button onclick="StartScreen.handleLeaderboardAccess()" class="flex-1 rounded-lg border border-amber-500 bg-amber-500/20 px-4 py-2 font-bold text-amber-400 transition-colors hover:bg-amber-500/30">Enter</button>
+            </div>
+          </div>
+        </div>`
+            : ""
+        }
+      </div>
+    `;
+    refreshIcons();
+    if (s.showLeaderboard) {
+      const input = document.getElementById("leaderboard-password-input");
+      if (input) {
+        input.focus();
+        input.setSelectionRange(input.value.length, input.value.length);
+      }
+    }
+  },
+
+  openLeaderboardModal() {
+    this.state.showLeaderboard = true;
+    this.render();
+  },
+
+  closeLeaderboardModal() {
+    this.state.showLeaderboard = false;
+    this.render();
+  },
+
+  onPasswordInput(value) {
+    this.state.password = value;
+    this.state.error = false;
+  },
+
+  handleLeaderboardAccess() {
+    if (this.state.password === LEADERBOARD_PASSWORD) {
+      this.state.showLeaderboard = false;
+      Game.goTo("leaderboard");
+    } else {
+      this.state.error = true;
+      this.render();
+    }
+  },
+};
+
+/* ---------------------------------------------------------------------
+ * LobbyRoom (mirrors src/screens/LobbyRoom.tsx)
+ * ------------------------------------------------------------------- */
+const LobbyRoom = {
+  mount(container) {
+    this.container = container;
+    this.state = {
+      showSticky: false,
+      showSafe: false,
+      showComputer: false,
+      safeUnlocked: false,
+      computerUnlocked: false,
+      safeError: false,
+      computerError: false,
+      computerPassword: "",
+      hasKeycard: false,
+      hasMap: false,
+      camerasViewed: false,
+    };
+    window.__pinRerender = window.__pinRerender || {};
+    window.__pinRerender["lobby-safe"] = () => this.render();
+    this.render();
+    return () => {
+      delete window.__pinRerender["lobby-safe"];
+    };
+  },
+
+  render() {
+    const s = this.state;
+    const C = LOBBY_CONFIG;
+    const canProceed = s.hasKeycard && s.camerasViewed;
+
+    this.container.innerHTML = `
+      <div class="relative min-h-screen bg-gray-950 px-4 py-6 sm:px-8">
+        ${RoomBackground({
+          image: "https://images.pexels.com/photos/518244/pexels-photo-518244.jpeg?auto=compress&cs=tinysrgb&h=650&w=940",
+          overlay: "from-gray-950/95 via-gray-950/85 to-gray-950/95",
+        })}
+        ${RoomHeader({ title: "Front Desk", subtitle: "The bank lobby. A reception desk sits in the center." })}
+
+        <div class="relative z-10 mx-auto max-w-4xl">
+          <div class="grid gap-6 sm:grid-cols-3">
+            <button onclick="LobbyRoom.openSticky()" class="group relative flex flex-col items-center justify-center overflow-hidden rounded-xl border border-yellow-600/50 bg-gradient-to-br from-yellow-100 to-yellow-200 p-8 shadow-lg transition-all hover:scale-105 hover:shadow-xl" style="transform: rotate(-2deg)">
+              <div class="absolute inset-0 opacity-20 transition-opacity group-hover:opacity-30">
+                <img src="https://images.pexels.com/photos/8071651/pexels-photo-8071651.jpeg?auto=compress&cs=tinysrgb&h=650&w=940" alt="" class="h-full w-full object-cover" />
+              </div>
+              ${icon("sticky-note", "relative z-10 mb-2 h-10 w-10 text-gray-700")}
+              <span class="relative z-10 text-sm font-semibold text-gray-700">Sticky Note</span>
+              <span class="relative z-10 mt-1 text-xs text-gray-500">Click to read</span>
+            </button>
+
+            <button onclick="LobbyRoom.openSafe()" class="group relative flex flex-col items-center justify-center overflow-hidden rounded-xl border border-gray-700 bg-gradient-to-br from-gray-800 to-gray-900 p-8 shadow-lg transition-all hover:scale-105 hover:border-amber-500/50 hover:shadow-xl">
+              <div class="absolute inset-0 opacity-25 transition-opacity group-hover:opacity-40">
+                <img src="https://images.pexels.com/photos/8466227/pexels-photo-8466227.jpeg?auto=compress&cs=tinysrgb&h=650&w=940" alt="" class="h-full w-full object-cover" />
+              </div>
+              ${s.safeUnlocked ? icon("check-circle-2", "relative z-10 mb-2 h-10 w-10 text-green-500") : icon("lock", "relative z-10 mb-2 h-10 w-10 text-gray-500 group-hover:text-amber-400")}
+              <span class="relative z-10 text-sm font-semibold text-gray-300">Mini-Box Safe</span>
+              <span class="relative z-10 mt-1 text-xs text-gray-500">${s.safeUnlocked ? "Unlocked" : "Locked"}</span>
+            </button>
+
+            <button onclick="LobbyRoom.openComputer()" class="group relative flex flex-col items-center justify-center overflow-hidden rounded-xl border border-gray-700 bg-gradient-to-br from-gray-800 to-gray-900 p-8 shadow-lg transition-all hover:scale-105 hover:border-amber-500/50 hover:shadow-xl">
+              <div class="absolute inset-0 opacity-25 transition-opacity group-hover:opacity-40">
+                <img src="https://images.pexels.com/photos/880989/pexels-photo-880989.jpeg?auto=compress&cs=tinysrgb&h=650&w=940" alt="" class="h-full w-full object-cover" />
+              </div>
+              ${icon("monitor", "relative z-10 mb-2 h-10 w-10 text-gray-500 group-hover:text-amber-400")}
+              <span class="relative z-10 text-sm font-semibold text-gray-300">Computer</span>
+              <span class="relative z-10 mt-1 text-xs text-gray-500">${s.computerUnlocked ? "Logged in" : "Locked"}</span>
+            </button>
+          </div>
+
+          ${
+            s.hasKeycard || s.hasMap
+              ? `
+          <div class="mt-8 rounded-xl border border-amber-500/20 bg-gray-900/50 p-4">
+            <h3 class="mb-3 text-sm font-bold uppercase tracking-wide text-amber-400">Items Found</h3>
+            <div class="flex flex-wrap gap-4">
+              ${
+                s.hasKeycard
+                  ? `<div class="flex items-center gap-2 rounded-lg border border-gray-700 bg-gray-800 px-3 py-2">${icon("credit-card", "h-5 w-5 text-amber-400")}<span class="text-sm text-gray-300">Key Card</span></div>`
+                  : ""
+              }
+              ${
+                s.hasMap
+                  ? `<div class="flex items-center gap-2 rounded-lg border border-gray-700 bg-gray-800 px-3 py-2">${icon("map", "h-5 w-5 text-amber-400")}<span class="text-sm text-gray-300">Bank Layout</span></div>`
+                  : ""
+              }
+            </div>
+            ${
+              s.hasMap
+                ? `
+            <div class="mt-4 rounded-lg border border-gray-800 bg-gray-950 p-4">
+              <p class="mb-2 text-xs font-bold uppercase text-gray-500">Bank Layout</p>
+              <div class="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                ${["Lobby", "Office", "Hallway", "Safe", "Vault"]
+                  .map(
+                    (room, i) => `
+                  <div class="rounded-lg border p-3 text-center text-xs ${
+                    i === 0 ? "border-green-500 bg-green-500/10 text-green-400" : "border-gray-700 bg-gray-800 text-gray-400"
+                  }">${room}</div>`
+                  )
+                  .join("")}
+              </div>
+              <p class="mt-3 text-xs text-gray-500">
+                The computer says: "Use the office computer to disable cameras. See Mr. Chen in the office."
+              </p>
+            </div>`
+                : ""
+            }
+          </div>`
+              : ""
+          }
+
+          ${
+            canProceed
+              ? `
+          <div class="mt-8 flex justify-center">
+            <button onclick="LobbyRoom.handleProceed()" class="group flex items-center gap-3 rounded-xl border border-amber-500 bg-amber-500/10 px-8 py-4 font-bold text-amber-400 transition-all hover:bg-amber-500 hover:text-gray-950 hover:shadow-[0_0_30px_rgba(245,158,11,0.4)]">
+              Go to Office
+              ${icon("arrow-right", "h-5 w-5 transition-transform group-hover:translate-x-1")}
+            </button>
+          </div>`
+              : ""
+          }
+
+          ${!s.hasKeycard ? `<p class="mt-8 text-center text-sm text-gray-500">Explore the desk. The sticky note may hold a code...</p>` : ""}
+          ${s.hasKeycard && !s.camerasViewed ? `<p class="mt-8 text-center text-sm text-gray-500">Check the computer to view the security cameras.</p>` : ""}
+        </div>
+
+        ${Modal({
+          open: s.showSticky,
+          onCloseExpr: "LobbyRoom.closeSticky()",
+          title: "Sticky Note",
+          bodyHtml: `
+            <div class="space-y-4">
+              <div class="rounded-lg border border-yellow-300 bg-yellow-100 p-6 shadow-md" style="transform: rotate(1deg)">
+                <p class="mb-2 text-sm font-bold text-gray-700">Safe Code Puzzle:</p>
+                <p class="text-sm text-gray-600">Start with the number <span class="font-mono text-lg font-bold text-gray-800">${C.ENCODED_SAFE_DIGITS}</span>.</p>
+                <p class="mt-1 text-sm text-gray-600">Add 3 to each digit. If a digit goes above 9, keep only the last digit (e.g., 8 + 3 = 11 &rarr; keep 1).</p>
+                <div class="mt-3 rounded bg-yellow-200/50 p-2 text-center">
+                  <p class="text-xs text-gray-500">4 + 3 = 7, 0 + 3 = 3, 6 + 3 = 9, 8 + 3 = 11 &rarr; 1</p>
+                </div>
+                <div class="my-4 border-t border-yellow-400"></div>
+                <p class="mb-2 text-sm font-bold text-gray-700">Computer Password (Caesar cipher):</p>
+                <p class="mb-2 font-mono text-2xl font-bold tracking-widest text-gray-800">${C.STICKY_CIPHER}</p>
+                <p class="text-sm text-gray-600">Shift each letter ${C.STICKY_SHIFT} to the left to decode.</p>
+                <div class="mt-3 border-t border-yellow-400 pt-3">
+                  <p class="text-xs text-gray-500">A B C D E F G H I J K L M</p>
+                  <p class="text-xs text-gray-500">N O P Q R S T U V W X Y Z</p>
+                  <p class="mt-1 text-xs text-gray-400">&larr; shift left &larr;</p>
+                </div>
+              </div>
+              <p class="text-center text-sm text-gray-400">Solve both puzzles: the digit puzzle gives the safe code, the cipher gives the computer password.</p>
+            </div>
+          `,
+        })}
+
+        ${Modal({
+          open: s.showSafe,
+          onCloseExpr: "LobbyRoom.closeSafe()",
+          title: "Mini-Box Safe",
+          bodyHtml: s.safeUnlocked
+            ? `
+              <div class="space-y-4 text-center">
+                ${icon("check-circle-2", "mx-auto h-16 w-16 text-green-500")}
+                <p class="text-gray-300">The safe swings open. Inside you find:</p>
+                <div class="flex justify-center gap-6">
+                  <div class="flex flex-col items-center gap-2">${icon("credit-card", "h-12 w-12 text-amber-400")}<span class="text-sm text-gray-300">Key Card</span></div>
+                  <div class="flex flex-col items-center gap-2">${icon("map", "h-12 w-12 text-amber-400")}<span class="text-sm text-gray-300">Bank Layout</span></div>
+                </div>
+                <p class="text-sm text-gray-500">The safe code was ${C.SAFE_CODE}. Remember the first digit: <span class="font-bold text-amber-400">7</span></p>
+              </div>`
+            : `
+              <div class="space-y-4">
+                <p class="text-center text-sm text-gray-400">Enter the 4-digit code to unlock the safe.</p>
+                ${PinInput({
+                  ns: "lobby-safe",
+                  length: 4,
+                  hint: s.safeError ? "Incorrect code. Try again." : "Read the sticky note — solve the digit puzzle to get the safe code.",
+                  onSubmit: (value) => LobbyRoom.handleSafeSubmit(value),
+                })}
+              </div>`,
+        })}
+
+        ${Modal({
+          open: s.showComputer,
+          onCloseExpr: "LobbyRoom.closeComputer()",
+          title: "Reception Computer",
+          maxWidth: "max-w-2xl",
+          bodyHtml: !s.computerUnlocked
+            ? `
+              <div class="space-y-4">
+                <div class="rounded-lg border border-gray-800 bg-gray-950 p-4">
+                  <p class="font-mono text-sm text-green-400">&gt; SYSTEM: Password required to log in.</p>
+                  <p class="font-mono text-sm text-green-400">&gt; HINT: Check the sticky note on the desk.</p>
+                </div>
+                <input id="lobby-computer-input" type="text" value="${escapeHtml(s.computerPassword)}"
+                  oninput="LobbyRoom.onComputerPasswordInput(this.value)"
+                  onkeydown="if(event.key==='Enter'){LobbyRoom.handleComputerLogin();}"
+                  placeholder="Enter password"
+                  class="w-full rounded-lg border ${s.computerError ? "border-red-500" : "border-gray-700 focus:border-amber-500"} bg-gray-800 px-4 py-3 text-center font-mono text-lg uppercase tracking-widest text-gray-200 outline-none transition-colors" />
+                ${s.computerError ? `<p class="text-center text-sm text-red-400">Incorrect password.</p>` : ""}
+                <button onclick="LobbyRoom.handleComputerLogin()" class="w-full rounded-lg border border-amber-500 bg-amber-500/20 py-3 font-bold text-amber-400 transition-colors hover:bg-amber-500/30">Log In</button>
+              </div>`
+            : `
+              <div class="space-y-4">
+                <div class="rounded-lg border border-green-500/30 bg-green-500/5 p-4">
+                  <p class="mb-2 font-mono text-sm text-green-400">&gt; ACCESS GRANTED. Welcome.</p>
+                </div>
+                <div class="rounded-lg border border-gray-800 bg-gray-950 p-4">
+                  <div class="mb-3 flex items-center gap-2">${icon("camera", "h-5 w-5 text-amber-400")}<span class="font-bold text-gray-200">Security Cameras</span></div>
+                  <div class="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                    ${["Lobby", "Office", "Hallway", "Safe Room", "Vault", "Exit"]
+                      .map(
+                        (cam) => `
+                      <div class="relative overflow-hidden rounded-lg border border-gray-700 bg-gray-800 p-3">
+                        <div class="flex items-center gap-1 text-xs text-gray-400">
+                          <span class="h-2 w-2 animate-pulse rounded-full bg-red-500"></span>${cam}
+                        </div>
+                        <div class="mt-2 h-16 rounded bg-gray-900/50"></div>
+                      </div>`
+                      )
+                      .join("")}
+                  </div>
+                  <p class="mt-3 text-xs text-gray-500">Cameras are active. You cannot turn them off from here. Go to Mr. Chen's office to disable them.</p>
+                </div>
+                <button onclick="LobbyRoom.acknowledgeComputer()" class="w-full rounded-lg border border-amber-500 bg-amber-500/20 py-3 font-bold text-amber-400 transition-colors hover:bg-amber-500/30">Acknowledge &amp; Continue</button>
+              </div>`,
+        })}
+      </div>
+    `;
+    refreshIcons();
+    const compInput = document.getElementById("lobby-computer-input");
+    if (compInput) {
+      compInput.focus();
+      compInput.setSelectionRange(compInput.value.length, compInput.value.length);
+    }
+  },
+
+  openSticky() {
+    this.state.showSticky = true;
+    this.render();
+  },
+  closeSticky() {
+    this.state.showSticky = false;
+    this.render();
+  },
+  openSafe() {
+    this.state.showSafe = true;
+    this.render();
+  },
+  closeSafe() {
+    this.state.showSafe = false;
+    this.render();
+  },
+  openComputer() {
+    this.state.showComputer = true;
+    this.render();
+  },
+  closeComputer() {
+    this.state.showComputer = false;
+    this.render();
+  },
+
+  handleSafeSubmit(value) {
+    const s = this.state;
+    if (value === LOBBY_CONFIG.SAFE_CODE) {
+      s.safeUnlocked = true;
+      s.safeError = false;
+      s.hasKeycard = true;
+      s.hasMap = true;
+      this.render();
+    } else {
+      s.safeError = true;
+      this.render();
+      setTimeout(() => {
+        s.safeError = false;
+        this.render();
+      }, 1500);
+    }
+  },
+
+  onComputerPasswordInput(value) {
+    this.state.computerPassword = value;
+    this.state.computerError = false;
+  },
+
+  handleComputerLogin() {
+    const s = this.state;
+    if (s.computerPassword.toUpperCase() === LOBBY_CONFIG.COMPUTER_PASSWORD) {
+      s.computerUnlocked = true;
+      s.computerError = false;
+    } else {
+      s.computerError = true;
+      setTimeout(() => {
+        s.computerError = false;
+        this.render();
+      }, 1500);
+    }
+    this.render();
+  },
+
+  acknowledgeComputer() {
+    this.state.camerasViewed = true;
+    this.state.showComputer = false;
+    this.render();
+  },
+
+  handleProceed() {
+    Game.addClue({
+      room: "lobby",
+      label: "Lobby Clue",
+      value: "7",
+      description: "First digit from the safe code",
+    });
+    Game.completeRoom("lobby");
+    Game.goTo("office");
+  },
+};
+
+/* ---------------------------------------------------------------------
+ * OfficeRoom (mirrors src/screens/OfficeRoom.tsx)
+ * ------------------------------------------------------------------- */
+const OfficeRoom = {
+  mount(container) {
+    this.container = container;
+    this.state = {
+      drawerOpen: false,
+      showSticky: false,
+      showComputer: false,
+      showRiddle: false,
+      computerUnlocked: false,
+      computerPassword: "",
+      computerError: false,
+      camerasDisabled: false,
+      riddleSolved: false,
+      riddleError: false,
+    };
+    window.__pinRerender = window.__pinRerender || {};
+    window.__pinRerender["office-riddle"] = () => this.render();
+    this.render();
+    return () => {
+      delete window.__pinRerender["office-riddle"];
+    };
+  },
+
+  digitFeedback(digit, index) {
+    const correct = OFFICE_CONFIG.MATH_ANSWER[index];
+    return digit === correct ? "correct" : "wrong";
+  },
+
+  render() {
+    const s = this.state;
+    const C = OFFICE_CONFIG;
+    const canProceed = s.camerasDisabled && s.riddleSolved;
+
+    this.container.innerHTML = `
+      <div class="relative min-h-screen bg-gray-950 px-4 py-6 sm:px-8">
+        ${RoomBackground({
+          image: "https://images.pexels.com/photos/880989/pexels-photo-880989.jpeg?auto=compress&cs=tinysrgb&h=650&w=940",
+          overlay: "from-gray-950/95 via-gray-950/85 to-gray-950/95",
+        })}
+        ${RoomHeader({ title: "Mr. Chen's Office", subtitle: "A cluttered office with a desk, a computer, and a bulletin board." })}
+
+        <div class="relative z-10 mx-auto max-w-4xl">
+          <div class="grid gap-6 sm:grid-cols-3">
+            <button onclick="OfficeRoom.openDrawer()" class="group relative flex flex-col items-center justify-center overflow-hidden rounded-xl border border-gray-700 bg-gradient-to-br from-gray-800 to-gray-900 p-8 shadow-lg transition-all hover:scale-105 hover:border-amber-500/50">
+              <div class="absolute inset-0 opacity-25 transition-opacity group-hover:opacity-40">
+                <img src="https://images.pexels.com/photos/3944802/pexels-photo-3944802.jpeg?auto=compress&cs=tinysrgb&h=650&w=940" alt="" class="h-full w-full object-cover" />
+              </div>
+              ${icon("archive", "relative z-10 mb-2 h-10 w-10 text-gray-500 group-hover:text-amber-400")}
+              <span class="relative z-10 text-sm font-semibold text-gray-300">Desk Drawer</span>
+              <span class="relative z-10 mt-1 text-xs text-gray-500">${s.drawerOpen ? "Searched" : "Search it"}</span>
+            </button>
+
+            <button onclick="OfficeRoom.openComputer()" class="group relative flex flex-col items-center justify-center overflow-hidden rounded-xl border border-gray-700 bg-gradient-to-br from-gray-800 to-gray-900 p-8 shadow-lg transition-all hover:scale-105 hover:border-amber-500/50">
+              <div class="absolute inset-0 opacity-25 transition-opacity group-hover:opacity-40">
+                <img src="https://images.pexels.com/photos/30692441/pexels-photo-30692441.jpeg?auto=compress&cs=tinysrgb&h=650&w=940" alt="" class="h-full w-full object-cover" />
+              </div>
+              ${s.computerUnlocked ? icon("check-circle-2", "relative z-10 mb-2 h-10 w-10 text-green-500") : icon("monitor", "relative z-10 mb-2 h-10 w-10 text-gray-500 group-hover:text-amber-400")}
+              <span class="relative z-10 text-sm font-semibold text-gray-300">Office Computer</span>
+              <span class="relative z-10 mt-1 text-xs text-gray-500">${
+                s.computerUnlocked ? (s.camerasDisabled ? "Cameras off" : "Disable cameras") : "Locked"
+              }</span>
+            </button>
+
+            <button onclick="OfficeRoom.openRiddle()" class="group relative flex flex-col items-center justify-center overflow-hidden rounded-xl border border-gray-700 bg-gradient-to-br from-gray-800 to-gray-900 p-8 shadow-lg transition-all hover:scale-105 hover:border-amber-500/50">
+              <div class="absolute inset-0 opacity-25 transition-opacity group-hover:opacity-40">
+                <img src="https://images.pexels.com/photos/8581050/pexels-photo-8581050.jpeg?auto=compress&cs=tinysrgb&h=650&w=940" alt="" class="h-full w-full object-cover" />
+              </div>
+              ${s.riddleSolved ? icon("check-circle-2", "relative z-10 mb-2 h-10 w-10 text-green-500") : icon("clipboard-list", "relative z-10 mb-2 h-10 w-10 text-gray-500 group-hover:text-amber-400")}
+              <span class="relative z-10 text-sm font-semibold text-gray-300">Bulletin Board</span>
+              <span class="relative z-10 mt-1 text-xs text-gray-500">${s.riddleSolved ? "Solved" : "Read riddle"}</span>
+            </button>
+          </div>
+
+          <div class="mt-8 space-y-3">
+            ${
+              !s.drawerOpen
+                ? `<div class="flex items-center gap-2 rounded-lg border border-gray-800 bg-gray-900/50 px-4 py-3 text-sm text-gray-500">${icon("alert-circle", "h-4 w-4")}Search the desk drawer to find something useful.</div>`
+                : ""
+            }
+            ${
+              s.drawerOpen && !s.computerUnlocked
+                ? `<div class="flex items-center gap-2 rounded-lg border border-gray-800 bg-gray-900/50 px-4 py-3 text-sm text-gray-500">${icon("alert-circle", "h-4 w-4")}Decipher the sticky note code to log into the computer.</div>`
+                : ""
+            }
+            ${
+              s.computerUnlocked && !s.camerasDisabled
+                ? `<div class="flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 px-4 py-3 text-sm text-amber-400">${icon("alert-circle", "h-4 w-4")}Disable the cameras on the computer!</div>`
+                : ""
+            }
+            ${
+              s.camerasDisabled && !s.riddleSolved
+                ? `<div class="flex items-center gap-2 rounded-lg border border-gray-800 bg-gray-900/50 px-4 py-3 text-sm text-gray-500">${icon("alert-circle", "h-4 w-4")}Check the bulletin board for the next room's code.</div>`
+                : ""
+            }
+          </div>
+
+          ${
+            canProceed
+              ? `
+          <div class="mt-8 flex justify-center">
+            <button onclick="OfficeRoom.handleProceed()" class="group flex items-center gap-3 rounded-xl border border-amber-500 bg-amber-500/10 px-8 py-4 font-bold text-amber-400 transition-all hover:bg-amber-500 hover:text-gray-950 hover:shadow-[0_0_30px_rgba(245,158,11,0.4)]">
+              Go to Hallway
+              ${icon("arrow-right", "h-5 w-5 transition-transform group-hover:translate-x-1")}
+            </button>
+          </div>`
+              : ""
+          }
+        </div>
+
+        ${
+          s.drawerOpen
+            ? `
+        <div class="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm" onclick="OfficeRoom.closeDrawer()">
+          <div class="relative w-full max-w-md rounded-2xl border border-amber-500/30 bg-gray-900 p-6 shadow-2xl" onclick="event.stopPropagation()">
+            <button onclick="OfficeRoom.closeDrawer()" class="absolute right-4 top-4 text-gray-500 hover:text-amber-400">&#10005;</button>
+            <h2 class="mb-4 font-serif text-xl font-bold text-amber-400">Desk Drawer</h2>
+            <p class="mb-4 text-sm text-gray-400">You rummage through the desk drawer and find a sticky note.</p>
+            <button onclick="OfficeRoom.openStickyFromDrawer()" class="flex w-full items-center gap-3 rounded-lg border border-yellow-300 bg-yellow-100 p-4 text-left transition-all hover:bg-yellow-200" style="transform: rotate(-1deg)">
+              ${icon("sticky-note", "h-8 w-8 text-gray-700")}
+              <div><p class="font-semibold text-gray-800">Sticky Note</p><p class="text-xs text-gray-600">Click to read</p></div>
+            </button>
+          </div>
+        </div>`
+            : ""
+        }
+
+        ${
+          s.showSticky
+            ? `
+        <div class="fixed inset-0 z-[70] flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm" onclick="OfficeRoom.closeSticky()">
+          <div class="relative w-full max-w-md rounded-2xl border border-yellow-300 bg-yellow-100 p-6 shadow-2xl" onclick="event.stopPropagation()" style="transform: rotate(1deg)">
+            <button onclick="OfficeRoom.closeSticky()" class="absolute right-4 top-4 text-gray-500 hover:text-gray-800">&#10005;</button>
+            <h2 class="mb-4 font-serif text-xl font-bold text-gray-800">Sticky Note</h2>
+            <div class="space-y-4">
+              <p class="text-sm text-gray-700">"Decipher this code to get the password to the computer:"</p>
+              <p class="font-mono text-3xl font-bold tracking-widest text-gray-900">${C.CIPHER_TEXT}</p>
+              <p class="text-sm text-gray-600">Shift 3 to the left.</p>
+              <div class="border-t border-yellow-400 pt-3">
+                <p class="text-xs text-gray-500">A B C D E F G H I J K L M</p>
+                <p class="text-xs text-gray-500">N O P Q R S T U V W X Y Z</p>
+                <p class="mt-1 text-xs text-gray-400">&larr; shift left &larr;</p>
+              </div>
+            </div>
+          </div>
+        </div>`
+            : ""
+        }
+
+        ${
+          s.showComputer
+            ? `
+        <div class="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm" onclick="OfficeRoom.closeComputer()">
+          <div class="relative w-full max-w-2xl rounded-2xl border border-amber-500/30 bg-gray-900 p-6 shadow-2xl" onclick="event.stopPropagation()">
+            <button onclick="OfficeRoom.closeComputer()" class="absolute right-4 top-4 text-gray-500 hover:text-amber-400">&#10005;</button>
+            <h2 class="mb-4 font-serif text-xl font-bold text-amber-400">Office Computer</h2>
+            ${
+              !s.computerUnlocked
+                ? `
+              <div class="space-y-4">
+                <div class="rounded-lg border border-gray-800 bg-gray-950 p-4">
+                  <p class="font-mono text-sm text-green-400">&gt; SYSTEM: Password required.</p>
+                  <p class="font-mono text-sm text-green-400">&gt; HINT: Decipher the sticky note code.</p>
+                </div>
+                <input id="office-computer-input" type="text" value="${escapeHtml(s.computerPassword)}"
+                  oninput="OfficeRoom.onComputerPasswordInput(this.value)"
+                  onkeydown="if(event.key==='Enter'){OfficeRoom.handleComputerLogin();}"
+                  placeholder="Enter password"
+                  class="w-full rounded-lg border ${s.computerError ? "border-red-500" : "border-gray-700 focus:border-amber-500"} bg-gray-800 px-4 py-3 text-center font-mono text-lg uppercase tracking-widest text-gray-200 outline-none transition-colors" />
+                ${s.computerError ? `<p class="text-center text-sm text-red-400">Incorrect password.</p>` : ""}
+                <button onclick="OfficeRoom.handleComputerLogin()" class="w-full rounded-lg border border-amber-500 bg-amber-500/20 py-3 font-bold text-amber-400 transition-colors hover:bg-amber-500/30">Log In</button>
+              </div>`
+                : `
+              <div class="space-y-4">
+                <div class="rounded-lg border border-green-500/30 bg-green-500/5 p-4">
+                  <p class="font-mono text-sm text-green-400">&gt; ACCESS GRANTED. Welcome, Mr. Chen.</p>
+                </div>
+                ${
+                  !s.camerasDisabled
+                    ? `
+                  <div class="rounded-lg border border-gray-800 bg-gray-950 p-4">
+                    <div class="mb-3 flex items-center gap-2">${icon("camera", "h-5 w-5 text-red-400")}<span class="font-bold text-gray-200">Security Camera System</span></div>
+                    <div class="grid grid-cols-3 gap-2">
+                      ${["Lobby", "Office", "Hallway", "Safe", "Vault", "Exit"]
+                        .map(
+                          (cam) => `
+                        <div class="rounded-lg border border-gray-700 bg-gray-800 p-3">
+                          <div class="flex items-center gap-1 text-xs text-gray-400">
+                            <span class="h-2 w-2 animate-pulse rounded-full bg-red-500"></span>${cam}
+                          </div>
+                        </div>`
+                        )
+                        .join("")}
+                    </div>
+                    <button onclick="OfficeRoom.disableCameras()" class="mt-4 w-full rounded-lg border border-red-500 bg-red-500/20 py-3 font-bold text-red-400 transition-colors hover:bg-red-500/30">Disable All Cameras</button>
+                  </div>`
+                    : `
+                  <div class="rounded-lg border border-green-500/30 bg-green-500/5 p-4 text-center">
+                    ${icon("camera-off", "mx-auto mb-2 h-10 w-10 text-green-500")}
+                    <p class="text-green-400">All cameras have been disabled. You can move freely now.</p>
+                  </div>`
+                }
+                <button onclick="OfficeRoom.closeComputer()" class="w-full rounded-lg border border-gray-700 bg-gray-800 py-2 text-gray-400 transition-colors hover:text-gray-200">Close</button>
+              </div>`
+            }
+          </div>
+        </div>`
+            : ""
+        }
+
+        ${
+          s.showRiddle
+            ? `
+        <div class="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm" onclick="OfficeRoom.closeRiddle()">
+          <div class="relative w-full max-w-lg rounded-2xl border border-amber-500/30 bg-gray-900 p-6 shadow-2xl" onclick="event.stopPropagation()">
+            <button onclick="OfficeRoom.closeRiddle()" class="absolute right-4 top-4 text-gray-500 hover:text-amber-400">${icon("x", "h-5 w-5")}</button>
+            <h2 class="mb-4 font-serif text-xl font-bold text-amber-400">Bulletin Board Riddle</h2>
+            ${
+              s.riddleSolved
+                ? `
+              <div class="space-y-4 text-center">
+                ${icon("check-circle-2", "mx-auto h-16 w-16 text-green-500")}
+                <p class="text-gray-300">The answer is <span class="font-bold text-amber-400">1369</span>.</p>
+                <p class="text-sm text-gray-500">1369 = 37&sup2; (a perfect square). First digit: 1 = 1&sup2;. Last digit: 9 = 3&sup2;. Middle two digits: 36 = 6&sup2;. All conditions satisfied!</p>
+                <p class="text-sm text-amber-400">The code to the next room is 1369. Remember the second digit: <span class="font-bold">3</span></p>
+              </div>`
+                : `
+              <div class="space-y-4">
+                <div class="rounded-lg border border-gray-800 bg-gray-950 p-4">
+                  <p class="text-sm text-gray-300">I am a 4-digit number. I am a perfect square, and I am not prime. My first digit is a perfect square, my last digit is a perfect square, and my middle two digits together form a perfect square as well. I am the code to the next room. What am I?</p>
+                </div>
+                <p class="text-center text-xs text-gray-500">Hint: Correct digits turn green, wrong ones turn red.</p>
+                ${PinInput({
+                  ns: "office-riddle",
+                  length: 4,
+                  hint: s.riddleError ? "Not quite. Try again." : "Enter the 4-digit answer",
+                  onSubmit: (value) => OfficeRoom.handleRiddleSubmit(value),
+                  digitFeedbackFn: (d, i) => OfficeRoom.digitFeedback(d, i),
+                })}
+              </div>`
+            }
+          </div>
+        </div>`
+            : ""
+        }
+      </div>
+    `;
+    refreshIcons();
+    const compInput = document.getElementById("office-computer-input");
+    if (compInput) {
+      compInput.focus();
+      compInput.setSelectionRange(compInput.value.length, compInput.value.length);
+    }
+  },
+
+  openDrawer() {
+    this.state.drawerOpen = true;
+    this.render();
+  },
+  closeDrawer() {
+    this.state.drawerOpen = false;
+    this.render();
+  },
+  openStickyFromDrawer() {
+    this.state.showSticky = true;
+    this.state.drawerOpen = false;
+    this.render();
+  },
+  closeSticky() {
+    this.state.showSticky = false;
+    this.render();
+  },
+  openComputer() {
+    this.state.showComputer = true;
+    this.render();
+  },
+  closeComputer() {
+    this.state.showComputer = false;
+    this.render();
+  },
+  openRiddle() {
+    this.state.showRiddle = true;
+    this.render();
+  },
+  closeRiddle() {
+    this.state.showRiddle = false;
+    this.render();
+  },
+
+  onComputerPasswordInput(value) {
+    this.state.computerPassword = value;
+    this.state.computerError = false;
+  },
+
+  handleComputerLogin() {
+    const s = this.state;
+    if (s.computerPassword.toUpperCase() === OFFICE_CONFIG.CIPHER_ANSWER) {
+      s.computerUnlocked = true;
+      s.computerError = false;
+    } else {
+      s.computerError = true;
+      setTimeout(() => {
+        s.computerError = false;
+        this.render();
+      }, 1500);
+    }
+    this.render();
+  },
+
+  disableCameras() {
+    this.state.camerasDisabled = true;
+    this.render();
+  },
+
+  handleRiddleSubmit(value) {
+    const s = this.state;
+    if (value === OFFICE_CONFIG.MATH_ANSWER) {
+      s.riddleSolved = true;
+      s.riddleError = false;
+      this.render();
+    } else {
+      s.riddleError = true;
+      this.render();
+      setTimeout(() => {
+        s.riddleError = false;
+        this.render();
+      }, 1500);
+    }
+  },
+
+  handleProceed() {
+    Game.addClue({
+      room: "office",
+      label: "Office Clue",
+      value: "3",
+      description: "Second digit from the math riddle answer",
+    });
+    Game.completeRoom("office");
+    Game.goTo("hallway");
+  },
+};
+
+/* ---------------------------------------------------------------------
+ * HallwayRoom (mirrors src/screens/HallwayRoom.tsx)
+ * ------------------------------------------------------------------- */
+const HallwayRoom = {
+  mount(container) {
+    this.container = container;
+    this.state = {
+      showPainting: false,
+      showTilePanel: false,
+      paintingOpened: false,
+      panelRevealed: false,
+      tileSolved: false,
+      clickedTiles: {},
+      tileError: false,
+      selectedDoor: null,
+      doorError: false,
+    };
+    this.timeouts = [];
+    this.render();
+    return () => {
+      this.timeouts.forEach((t) => clearTimeout(t));
+      this.timeouts = [];
+    };
+  },
+
+  render() {
+    const s = this.state;
+    const C = HALLWAY_CONFIG;
+    const canProceed = s.tileSolved && s.selectedDoor === C.CORRECT_DOOR;
+
+    this.container.innerHTML = `
+      <div class="relative min-h-screen bg-gray-950 px-4 py-6 sm:px-8">
+        ${RoomBackground({
+          image: "https://images.pexels.com/photos/18192551/pexels-photo-18192551.jpeg?auto=compress&cs=tinysrgb&h=650&w=940",
+          overlay: "from-gray-950/95 via-gray-950/85 to-gray-950/95",
+        })}
+        ${RoomHeader({ title: "The Hallway", subtitle: "A long corridor with a painting on the wall and several doors." })}
+
+        <div class="relative z-10 mx-auto max-w-4xl">
+          <div class="grid gap-6 sm:grid-cols-2">
+            <button onclick="HallwayRoom.openPainting()" class="group relative flex flex-col items-center justify-center overflow-hidden rounded-xl border border-gray-700 bg-gradient-to-br from-gray-800 to-gray-900 p-8 shadow-lg transition-all hover:scale-105 hover:border-amber-500/50">
+              <div class="absolute inset-0 opacity-30 transition-opacity group-hover:opacity-45">
+                <img src="https://images.pexels.com/photos/26605624/pexels-photo-26605624.jpeg?auto=compress&cs=tinysrgb&h=650&w=940" alt="" class="h-full w-full object-cover" />
+              </div>
+              ${s.paintingOpened ? icon("check-circle-2", "relative z-10 mb-2 h-10 w-10 text-green-500") : icon("frame", "relative z-10 mb-2 h-10 w-10 text-gray-500 group-hover:text-amber-400")}
+              <span class="relative z-10 text-sm font-semibold text-gray-300">Painting</span>
+              <span class="relative z-10 mt-1 text-xs text-gray-500">${s.paintingOpened ? "Examined" : "Look behind it"}</span>
+            </button>
+
+            <button onclick="HallwayRoom.openTilePanel()" ${!s.panelRevealed ? "disabled" : ""} class="group relative flex flex-col items-center justify-center overflow-hidden rounded-xl border p-8 shadow-lg transition-all ${
+      s.panelRevealed
+        ? "border-gray-700 bg-gradient-to-br from-gray-800 to-gray-900 hover:scale-105 hover:border-amber-500/50"
+        : "cursor-not-allowed border-gray-800 bg-gray-900/50 opacity-50"
+    }">
+              ${
+                s.panelRevealed
+                  ? `<div class="absolute inset-0 opacity-25 transition-opacity group-hover:opacity-40"><img src="https://images.pexels.com/photos/5412637/pexels-photo-5412637.jpeg?auto=compress&cs=tinysrgb&h=650&w=940" alt="" class="h-full w-full object-cover" /></div>`
+                  : ""
+              }
+              ${s.tileSolved ? icon("check-circle-2", "relative z-10 mb-2 h-10 w-10 text-green-500") : icon("grid-3x3", "relative z-10 mb-2 h-10 w-10 text-gray-500 group-hover:text-amber-400")}
+              <span class="relative z-10 text-sm font-semibold text-gray-300">Floor Panel</span>
+              <span class="relative z-10 mt-1 text-xs text-gray-500">${
+                s.panelRevealed ? (s.tileSolved ? "Solved" : "Tile grid") : "Not yet revealed"
+              }</span>
+            </button>
+          </div>
+
+          ${
+            s.tileSolved
+              ? `
+          <div class="mt-8">
+            <h3 class="mb-4 text-center text-sm font-bold uppercase tracking-wide text-amber-400">Choose the correct door</h3>
+            <div class="grid grid-cols-3 gap-3 sm:grid-cols-6">
+              ${[1, 2, 3, 4, 5, 6]
+                .map(
+                  (door) => `
+                <button onclick="HallwayRoom.handleDoorSelect(${door})" class="flex flex-col items-center justify-center rounded-xl border-2 p-6 transition-all ${
+                    s.selectedDoor === door
+                      ? s.doorError
+                        ? "border-red-500 bg-red-500/20"
+                        : "border-green-500 bg-green-500/20"
+                      : "border-gray-700 bg-gray-800 hover:border-amber-500/50"
+                  }">
+                  ${icon("door-open", "mb-2 h-8 w-8 text-gray-400")}
+                  <span class="font-mono text-2xl font-bold text-gray-200">${door}</span>
+                </button>`
+                )
+                .join("")}
+            </div>
+            ${s.doorError ? `<p class="mt-3 text-center text-sm text-red-400">Wrong door! Try again.</p>` : ""}
+            ${
+              s.selectedDoor === C.CORRECT_DOOR && !s.doorError
+                ? `<p class="mt-3 text-center text-sm text-green-400">Correct! The riddle says: "The door whose number equals x + y."</p>`
+                : ""
+            }
+          </div>`
+              : ""
+          }
+
+          <div class="mt-8 space-y-3">
+            ${
+              !s.paintingOpened
+                ? `<div class="flex items-center gap-2 rounded-lg border border-gray-800 bg-gray-900/50 px-4 py-3 text-sm text-gray-500">${icon("alert-circle", "h-4 w-4")}There's a painting at the end of the corridor. Check behind it.</div>`
+                : ""
+            }
+            ${
+              s.paintingOpened && !s.panelRevealed
+                ? `<div class="flex items-center gap-2 rounded-lg border border-gray-800 bg-gray-900/50 px-4 py-3 text-sm text-gray-500">${icon("alert-circle", "h-4 w-4")}A seam in the floor has opened. Click the floor panel to reveal a tile grid.</div>`
+                : ""
+            }
+            ${
+              s.panelRevealed && !s.tileSolved
+                ? `<div class="flex items-center gap-2 rounded-lg border border-gray-800 bg-gray-900/50 px-4 py-3 text-sm text-gray-500">${icon("alert-circle", "h-4 w-4")}Solve the system of equations to find which tile to click. The grid is 5x5 (rows 0-4, columns 0-4). Click the tile at (row=y, col=x).</div>`
+                : ""
+            }
+          </div>
+
+          ${
+            canProceed
+              ? `
+          <div class="mt-8 flex justify-center">
+            <button onclick="HallwayRoom.handleProceed()" class="group flex items-center gap-3 rounded-xl border border-amber-500 bg-amber-500/10 px-8 py-4 font-bold text-amber-400 transition-all hover:bg-amber-500 hover:text-gray-950 hover:shadow-[0_0_30px_rgba(245,158,11,0.4)]">
+              Go to Safe Room
+              ${icon("arrow-right", "h-5 w-5 transition-transform group-hover:translate-x-1")}
+            </button>
+          </div>`
+              : ""
+          }
+        </div>
+
+        ${
+          s.showPainting
+            ? `
+        <div class="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm" onclick="HallwayRoom.closePainting()">
+          <div class="relative w-full max-w-lg rounded-2xl border border-amber-500/30 bg-gray-900 p-6 shadow-2xl" onclick="event.stopPropagation()">
+            <button onclick="HallwayRoom.closePainting()" class="absolute right-4 top-4 text-gray-500 hover:text-amber-400">${icon("x", "h-5 w-5")}</button>
+            <h2 class="mb-4 font-serif text-xl font-bold text-amber-400">Behind the Painting</h2>
+            <div class="space-y-4">
+              <div class="rounded-lg border border-gray-800 bg-gray-950 p-4">
+                <p class="mb-2 text-sm font-bold text-gray-300">System of Equations:</p>
+                <p class="font-mono text-lg text-amber-400">2x + y = 7</p>
+                <p class="font-mono text-lg text-amber-400">x - y = -1</p>
+              </div>
+              <div class="rounded-lg border border-gray-800 bg-gray-950 p-4">
+                <p class="mb-2 text-sm font-bold text-gray-300">Riddle:</p>
+                <p class="text-sm text-gray-400">"Solve for x and y. The tile grid reveals a path — click the tile at row y, column x. Then find the door whose number equals x + y."</p>
+              </div>
+              ${
+                !s.paintingOpened
+                  ? `<button onclick="HallwayRoom.revealPanel()" class="w-full rounded-lg border border-amber-500 bg-amber-500/20 py-3 font-bold text-amber-400 transition-colors hover:bg-amber-500/30">Reveal Floor Panel</button>`
+                  : ""
+              }
+            </div>
+          </div>
+        </div>`
+            : ""
+        }
+
+        ${
+          s.showTilePanel
+            ? `
+        <div class="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm" onclick="HallwayRoom.closeTilePanel()">
+          <div class="relative w-full max-w-lg rounded-2xl border border-amber-500/30 bg-gray-900 p-6 shadow-2xl" onclick="event.stopPropagation()">
+            <button onclick="HallwayRoom.closeTilePanel()" class="absolute right-4 top-4 text-gray-500 hover:text-amber-400">${icon("x", "h-5 w-5")}</button>
+            <h2 class="mb-4 font-serif text-xl font-bold text-amber-400">Floor Tile Grid</h2>
+            ${
+              s.tileSolved
+                ? `
+              <div class="space-y-4 text-center">
+                ${icon("check-circle-2", "mx-auto h-16 w-16 text-green-500")}
+                <p class="text-gray-300">You clicked tile at row ${C.CORRECT_TILE.row}, column ${C.CORRECT_TILE.col} — matching (y=${C.SOLUTION_Y}, x=${C.SOLUTION_X}).</p>
+                <p class="text-sm text-gray-500">x + y = ${C.SOLUTION_X} + ${C.SOLUTION_Y} = ${C.CORRECT_DOOR}. Choose door #${C.CORRECT_DOOR}.</p>
+              </div>`
+                : `
+              <div class="space-y-4">
+                <p class="text-center text-sm text-gray-400">Click the tile at row y, column x. Rows go top to bottom (0-4), columns left to right (0-4).</p>
+                <div class="flex justify-center">
+                  <div class="grid grid-cols-5 gap-1">
+                    ${Array.from({ length: 25 })
+                      .map((_, i) => {
+                        const row = Math.floor(i / 5);
+                        const col = i % 5;
+                        const key = `${row}-${col}`;
+                        const isClicked = s.clickedTiles[key];
+                        const cls = isClicked
+                          ? s.tileError
+                            ? "border-red-500 bg-red-500/30"
+                            : "border-green-500 bg-green-500/30"
+                          : "border-gray-700 bg-gray-800 hover:border-amber-500/50 hover:bg-gray-700";
+                        return `<button onclick="HallwayRoom.handleTileClick(${row},${col})" class="h-12 w-12 rounded-md border-2 font-mono text-xs transition-all ${cls}">${row},${col}</button>`;
+                      })
+                      .join("")}
+                  </div>
+                </div>
+                <div class="flex justify-center gap-6 text-xs text-gray-500"><span>&larr; columns (x) &rarr;</span></div>
+                <p class="text-center text-xs text-gray-500">&uarr; rows (y) &darr;</p>
+                ${s.tileError ? `<p class="text-center text-sm text-red-400">Wrong tile! Try again.</p>` : ""}
+              </div>`
+            }
+          </div>
+        </div>`
+            : ""
+        }
+      </div>
+    `;
+    refreshIcons();
+  },
+
+  openPainting() {
+    this.state.showPainting = true;
+    this.render();
+  },
+  closePainting() {
+    this.state.showPainting = false;
+    this.render();
+  },
+  revealPanel() {
+    this.state.paintingOpened = true;
+    this.state.panelRevealed = true;
+    this.state.showPainting = false;
+    this.render();
+  },
+  openTilePanel() {
+    if (!this.state.panelRevealed) return;
+    this.state.showTilePanel = true;
+    this.render();
+  },
+  closeTilePanel() {
+    this.state.showTilePanel = false;
+    this.render();
+  },
+
+  handleTileClick(row, col) {
+    const s = this.state;
+    const key = `${row}-${col}`;
+    if (s.clickedTiles[key]) return;
+    const C = HALLWAY_CONFIG;
+
+    if (row === C.CORRECT_TILE.row && col === C.CORRECT_TILE.col) {
+      s.clickedTiles = { ...s.clickedTiles, [key]: true };
+      s.tileSolved = true;
+      s.tileError = false;
+      s.panelRevealed = true;
+      this.render();
+    } else {
+      s.clickedTiles = { ...s.clickedTiles, [key]: true };
+      s.tileError = true;
+      this.render();
+      const t = setTimeout(() => {
+        const next = { ...s.clickedTiles };
+        delete next[key];
+        s.clickedTiles = next;
+        s.tileError = false;
+        this.render();
+      }, 1000);
+      this.timeouts.push(t);
+    }
+  },
+
+  handleDoorSelect(door) {
+    const s = this.state;
+    s.selectedDoor = door;
+    if (door === HALLWAY_CONFIG.CORRECT_DOOR) {
+      s.doorError = false;
+      this.render();
+    } else {
+      s.doorError = true;
+      this.render();
+      const t = setTimeout(() => {
+        s.selectedDoor = null;
+        s.doorError = false;
+        this.render();
+      }, 1500);
+      this.timeouts.push(t);
+    }
+  },
+
+  handleProceed() {
+    Game.addClue({
+      room: "hallway",
+      label: "Hallway Clue",
+      value: String(HALLWAY_CONFIG.CORRECT_DOOR),
+      description: "The correct door number (x + y = 5)",
+    });
+    Game.completeRoom("hallway");
+    Game.goTo("safe");
+  },
+};
+
+/* ---------------------------------------------------------------------
+ * SafeRoom (mirrors src/screens/SafeRoom.tsx)
+ * ------------------------------------------------------------------- */
+const SafeRoom = {
+  mount(container) {
+    this.container = container;
+    this.state = {
+      showLaser: false,
+      showComputer: false,
+      laserSolved: false,
+      playerPos: { row: 0, col: 0 },
+      moveSequence: [],
+      laserError: false,
+
+      alarmActive: false,
+      alarmTimeLeft: 30,
+      showAlarm: false,
+      alarmSolved: false,
+      alarmError: false,
+      showOverride: false,
+      overrideError: false,
+
+      vaultUnlocked: false,
+      vaultError: false,
+    };
+    this.timeouts = [];
+    this.alarmTimer = null;
+    window.__pinRerender = window.__pinRerender || {};
+    window.__pinRerender["safe-vault"] = () => this.render();
+    window.__pinRerender["safe-alarm"] = () => this.render();
+    window.__pinRerender["safe-override"] = () => this.render();
+    this.render();
+    return () => {
+      this.timeouts.forEach((t) => clearTimeout(t));
+      this.timeouts = [];
+      this.stopAlarmTimer();
+      delete window.__pinRerender["safe-vault"];
+      delete window.__pinRerender["safe-alarm"];
+      delete window.__pinRerender["safe-override"];
+    };
+  },
+
+  applyMove(pos, move) {
+    const G = SAFE_CONFIG.GRID_SIZE;
+    switch (move) {
+      case "up":
+        return { row: Math.max(0, pos.row - 1), col: pos.col };
+      case "down":
+        return { row: Math.min(G - 1, pos.row + 1), col: pos.col };
+      case "left":
+        return { row: pos.row, col: Math.max(0, pos.col - 1) };
+      case "right":
+        return { row: pos.row, col: Math.min(G - 1, pos.col + 1) };
+    }
+  },
+
+  startAlarmTimer() {
+    this.stopAlarmTimer();
+    this.alarmTimer = setTimeout(() => this.tickAlarm(), 1000);
+  },
+
+  stopAlarmTimer() {
+    if (this.alarmTimer) {
+      clearTimeout(this.alarmTimer);
+      this.alarmTimer = null;
+    }
+  },
+
+  tickAlarm() {
+    const s = this.state;
+    if (!s.alarmActive || s.alarmSolved) return;
+    if (s.alarmTimeLeft <= 0) {
+      s.showOverride = true;
+      s.alarmActive = false;
+      this.render();
+      return;
+    }
+    s.alarmTimeLeft -= 1;
+    this.render();
+    if (s.alarmActive && !s.alarmSolved) {
+      this.startAlarmTimer();
+    }
+  },
+
+  render() {
+    const s = this.state;
+    const C = SAFE_CONFIG;
+    const canProceed = s.laserSolved && s.vaultUnlocked && s.alarmSolved;
+    const clues = Game.clues;
+
+    this.container.innerHTML = `
+      <div class="relative min-h-screen bg-gray-950 px-4 py-6 sm:px-8">
+        ${RoomBackground({
+          image: "https://images.pexels.com/photos/18545023/pexels-photo-18545023.jpeg?auto=compress&cs=tinysrgb&h=650&w=940",
+          overlay: "from-gray-950/95 via-gray-950/80 to-gray-950/95",
+        })}
+        ${RoomHeader({ title: "Pre-Vault Safe Room", subtitle: "A laser grid blocks access to the vault computer." })}
+
+        <div class="relative z-10 mx-auto max-w-4xl">
+          <div class="grid gap-6 sm:grid-cols-2">
+            <button onclick="SafeRoom.openLaser()" class="group relative flex flex-col items-center justify-center overflow-hidden rounded-xl border border-red-500/30 bg-gradient-to-br from-gray-800 to-gray-900 p-8 shadow-lg transition-all hover:scale-105 hover:border-red-400">
+              <div class="absolute inset-0 opacity-30 transition-opacity group-hover:opacity-50">
+                <img src="https://images.pexels.com/photos/18545023/pexels-photo-18545023.jpeg?auto=compress&cs=tinysrgb&h=650&w=940" alt="" class="h-full w-full object-cover" />
+              </div>
+              ${s.laserSolved ? icon("check-circle-2", "relative z-10 mb-2 h-10 w-10 text-green-500") : icon("zap", "relative z-10 mb-2 h-10 w-10 text-red-400 group-hover:text-amber-400")}
+              <span class="relative z-10 text-sm font-semibold text-gray-300">Laser Maze</span>
+              <span class="relative z-10 mt-1 text-xs text-gray-500">${s.laserSolved ? "Disabled" : "Navigate the grid"}</span>
+            </button>
+
+            <button onclick="SafeRoom.openComputer()" ${!s.laserSolved ? "disabled" : ""} class="group relative flex flex-col items-center justify-center overflow-hidden rounded-xl border p-8 shadow-lg transition-all ${
+      s.laserSolved
+        ? "border-gray-700 bg-gradient-to-br from-gray-800 to-gray-900 hover:scale-105 hover:border-amber-500/50"
+        : "cursor-not-allowed border-gray-800 bg-gray-900/50 opacity-50"
+    }">
+              ${
+                s.laserSolved
+                  ? `<div class="absolute inset-0 opacity-25 transition-opacity group-hover:opacity-40"><img src="https://images.pexels.com/photos/19882101/pexels-photo-19882101.jpeg?auto=compress&cs=tinysrgb&h=650&w=940" alt="" class="h-full w-full object-cover" /></div>`
+                  : ""
+              }
+              ${s.vaultUnlocked ? icon("check-circle-2", "relative z-10 mb-2 h-10 w-10 text-green-500") : icon("monitor", "relative z-10 mb-2 h-10 w-10 text-gray-500 group-hover:text-amber-400")}
+              <span class="relative z-10 text-sm font-semibold text-gray-300">Vault Computer</span>
+              <span class="relative z-10 mt-1 text-xs text-gray-500">${
+                s.vaultUnlocked ? "Unlocked" : s.laserSolved ? "Enter the code" : "Disabled by laser"
+              }</span>
+            </button>
+          </div>
+
+          <div class="mt-8 rounded-xl border border-amber-500/20 bg-gray-900/50 p-4">
+            <h3 class="mb-3 text-sm font-bold uppercase tracking-wide text-amber-400">Clues So Far</h3>
+            <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
+              ${[
+                { room: "lobby", label: "Lobby", value: "7" },
+                { room: "office", label: "Office", value: "3" },
+                { room: "hallway", label: "Hallway", value: "5" },
+                { room: "safe", label: "Safe Room", value: s.alarmSolved ? C.ALARM_ANSWER : "?" },
+              ]
+                .map(
+                  (c) => `
+                <div class="rounded-lg border border-gray-700 bg-gray-800 p-3 text-center">
+                  <p class="text-xs text-gray-500">${c.label}</p>
+                  <p class="mt-1 font-mono text-2xl font-bold text-amber-400">${(clues[c.room] && clues[c.room].value) ?? c.value}</p>
+                </div>`
+                )
+                .join("")}
+            </div>
+          </div>
+
+          <div class="mt-6 space-y-3">
+            ${
+              !s.laserSolved
+                ? `<div class="flex items-center gap-2 rounded-lg border border-gray-800 bg-gray-900/50 px-4 py-3 text-sm text-gray-500">${icon("alert-triangle", "h-4 w-4")}Disable the laser maze first to access the vault computer.</div>`
+                : ""
+            }
+            ${
+              s.laserSolved && !s.vaultUnlocked && !s.alarmActive && !s.alarmSolved
+                ? `<div class="flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 px-4 py-3 text-sm text-amber-400">${icon("alert-triangle", "h-4 w-4")}Access the vault computer to enter the code.</div>`
+                : ""
+            }
+            ${
+              s.alarmActive
+                ? `<div class="flex items-center gap-2 rounded-lg border border-red-500/50 bg-red-500/10 px-4 py-3 text-sm text-red-400">${icon("shield-alert", "h-4 w-4 animate-pulse")}ALARM ACTIVE! ${s.alarmTimeLeft}s until lockdown!</div>`
+                : ""
+            }
+          </div>
+
+          ${
+            canProceed
+              ? `
+          <div class="mt-8 flex justify-center">
+            <button onclick="SafeRoom.handleProceed()" class="group flex items-center gap-3 rounded-xl border border-amber-500 bg-amber-500/10 px-8 py-4 font-bold text-amber-400 transition-all hover:bg-amber-500 hover:text-gray-950 hover:shadow-[0_0_30px_rgba(245,158,11,0.4)]">
+              Enter the Vault
+              ${icon("arrow-right", "h-5 w-5 transition-transform group-hover:translate-x-1")}
+            </button>
+          </div>`
+              : ""
+          }
+        </div>
+
+        ${
+          s.showLaser
+            ? `
+        <div class="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm" onclick="SafeRoom.closeLaser()">
+          <div class="relative w-full max-w-lg rounded-2xl border border-amber-500/30 bg-gray-900 p-6 shadow-2xl" onclick="event.stopPropagation()">
+            <button onclick="SafeRoom.closeLaser()" class="absolute right-4 top-4 text-gray-500 hover:text-amber-400">${icon("x", "h-5 w-5")}</button>
+            <h2 class="mb-4 font-serif text-xl font-bold text-amber-400">Laser Maze</h2>
+            ${
+              s.laserSolved
+                ? `
+              <div class="space-y-4 text-center">
+                ${icon("check-circle-2", "mx-auto h-16 w-16 text-green-500")}
+                <p class="text-gray-300">Laser system disabled! You can now access the vault computer.</p>
+              </div>`
+                : `
+              <div class="space-y-4">
+                <p class="text-center text-sm text-gray-400">Navigate from the top-left corner to the bottom-right. Use the arrow buttons. One wrong move resets the maze.</p>
+                <div class="flex justify-center">
+                  <div class="grid gap-1" style="grid-template-columns: repeat(${C.GRID_SIZE}, 1fr)">
+                    ${Array.from({ length: C.GRID_SIZE * C.GRID_SIZE })
+                      .map((_, i) => {
+                        const row = Math.floor(i / C.GRID_SIZE);
+                        const col = i % C.GRID_SIZE;
+                        const isPlayer = s.playerPos.row === row && s.playerPos.col === col;
+                        const isStart = row === 0 && col === 0;
+                        const isEnd = row === C.GRID_SIZE - 1 && col === C.GRID_SIZE - 1;
+                        const cls = isPlayer
+                          ? s.laserError
+                            ? "border-red-500 bg-red-500/40"
+                            : "border-amber-500 bg-amber-500/40"
+                          : isEnd
+                          ? "border-green-500/50 bg-green-500/10"
+                          : isStart
+                          ? "border-blue-500/50 bg-blue-500/10"
+                          : "border-gray-700 bg-gray-800";
+                        const label = isPlayer ? "&#9679;" : isEnd ? "&#9733;" : isStart ? "S" : "";
+                        return `<div class="flex h-10 w-10 items-center justify-center rounded border-2 text-xs ${cls}">${label}</div>`;
+                      })
+                      .join("")}
+                  </div>
+                </div>
+                <p class="text-center text-xs text-gray-500">Moves: ${s.moveSequence.length} / ${C.CORRECT_PATH.length}</p>
+                <div class="mx-auto flex max-w-[200px] flex-col items-center gap-2">
+                  <button onclick="SafeRoom.handleMove('up')" class="rounded-lg border border-gray-700 bg-gray-800 p-3 text-gray-300 transition-all hover:border-amber-500 hover:text-amber-400 active:scale-95">${icon(
+                    "arrow-up",
+                    "h-5 w-5"
+                  )}</button>
+                  <div class="flex gap-2">
+                    <button onclick="SafeRoom.handleMove('left')" class="rounded-lg border border-gray-700 bg-gray-800 p-3 text-gray-300 transition-all hover:border-amber-500 hover:text-amber-400 active:scale-95">${icon(
+                      "arrow-left",
+                      "h-5 w-5"
+                    )}</button>
+                    <button onclick="SafeRoom.handleMove('down')" class="rounded-lg border border-gray-700 bg-gray-800 p-3 text-gray-300 transition-all hover:border-amber-500 hover:text-amber-400 active:scale-95">${icon(
+                      "arrow-down",
+                      "h-5 w-5"
+                    )}</button>
+                    <button onclick="SafeRoom.handleMove('right')" class="rounded-lg border border-gray-700 bg-gray-800 p-3 text-gray-300 transition-all hover:border-amber-500 hover:text-amber-400 active:scale-95">${icon(
+                      "arrow-right",
+                      "h-5 w-5"
+                    )}</button>
+                  </div>
+                </div>
+                ${s.laserError ? `<p class="text-center text-sm text-red-400">Wrong move! Maze reset.</p>` : ""}
+              </div>`
+            }
+          </div>
+        </div>`
+            : ""
+        }
+
+        ${
+          s.showComputer
+            ? `
+        <div class="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm" onclick="SafeRoom.closeComputer()">
+          <div class="relative w-full max-w-lg rounded-2xl border border-amber-500/30 bg-gray-900 p-6 shadow-2xl" onclick="event.stopPropagation()">
+            <button onclick="SafeRoom.closeComputer()" class="absolute right-4 top-4 text-gray-500 hover:text-amber-400">${icon("x", "h-5 w-5")}</button>
+            <h2 class="mb-4 font-serif text-xl font-bold text-amber-400">Vault Computer</h2>
+            ${
+              s.vaultUnlocked
+                ? `
+              <div class="space-y-4 text-center">
+                ${icon("check-circle-2", "mx-auto h-16 w-16 text-green-500")}
+                <p class="text-gray-300">Vault access granted! Proceed to the vault.</p>
+              </div>`
+                : `
+              <div class="space-y-4">
+                <div class="rounded-lg border border-gray-800 bg-gray-950 p-4">
+                  <p class="mb-2 font-mono text-sm text-green-400">&gt; VAULT ACCESS PROTOCOL</p>
+                  <p class="text-sm text-gray-300">Combine the clues from each room to form the vault code:</p>
+                  <div class="mt-3 space-y-1 text-sm text-gray-400">
+                    <p>Lobby clue (digit 1): <span class="font-mono text-amber-400">${(clues.lobby && clues.lobby.value) ?? "7"}</span></p>
+                    <p>Hallway clue (digit 2): <span class="font-mono text-amber-400">${(clues.hallway && clues.hallway.value) ?? "9"}</span></p>
+                    <p>Office clue (digit 3): <span class="font-mono text-amber-400">${(clues.office && clues.office.value) ?? "3"}</span></p>
+                    <p>Safe room clue (digit 4): <span class="font-mono text-amber-400">${s.alarmSolved ? C.ALARM_ANSWER : "Solve the alarm first!"}</span></p>
+                  </div>
+                  <p class="mt-3 text-sm text-gray-300">Arrange: digit1, digit2, digit3, digit4</p>
+                </div>
+                ${PinInput({
+                  ns: "safe-vault",
+                  length: 4,
+                  hint: s.vaultError ? "Incorrect code. Try again." : "Enter the 4-digit vault code",
+                  onSubmit: (value) => SafeRoom.handleVaultSubmit(value),
+                })}
+              </div>`
+            }
+          </div>
+        </div>`
+            : ""
+        }
+
+        ${
+          s.showAlarm
+            ? `
+        <div class="fixed inset-0 z-[70] flex items-center justify-center bg-red-950/80 p-4 backdrop-blur-sm">
+          <div class="w-full max-w-md rounded-2xl border-2 border-red-500 bg-gray-900 p-6 shadow-2xl">
+            <div class="mb-4 flex items-center gap-3">
+              ${icon("shield-alert", "h-8 w-8 animate-pulse text-red-500")}
+              <h2 class="font-serif text-2xl font-bold text-red-400">SECURITY ALARM</h2>
+            </div>
+            <div class="mb-4 flex items-center justify-center gap-2">
+              ${icon("timer", "h-6 w-6 text-red-400")}
+              <span class="font-mono text-4xl font-bold text-red-400">${s.alarmTimeLeft.toString().padStart(2, "0")}</span>
+              <span class="text-sm text-red-400">seconds</span>
+            </div>
+            <p class="mb-4 text-center text-sm text-gray-300">Solve this equation to disable the alarm before lockdown:</p>
+            <div class="mb-4 rounded-lg border border-red-500/30 bg-red-500/5 p-4 text-center">
+              <p class="font-mono text-xl text-amber-400">4x + 3 = 19</p>
+              <p class="mt-1 text-xs text-gray-500">Find x</p>
+            </div>
+            ${PinInput({
+              ns: "safe-alarm",
+              length: 1,
+              hint: s.alarmError ? "Wrong answer! Hurry!" : "Enter the value of x",
+              onSubmit: (value) => SafeRoom.handleAlarmSubmit(value),
+            })}
+          </div>
+        </div>`
+            : ""
+        }
+
+        ${
+          s.showOverride && !s.alarmSolved
+            ? `
+        <div class="fixed inset-0 z-[70] flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm">
+          <div class="w-full max-w-md rounded-2xl border-2 border-amber-500 bg-gray-900 p-6 shadow-2xl">
+            <div class="mb-4 flex items-center gap-3">
+              ${icon("alert-triangle", "h-8 w-8 text-amber-400")}
+              <h2 class="font-serif text-2xl font-bold text-amber-400">Security Override</h2>
+            </div>
+            <p class="mb-4 text-center text-sm text-gray-300">The alarm timed out, but you get one more chance. Solve this equation:</p>
+            <div class="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/5 p-4 text-center">
+              <p class="font-mono text-xl text-amber-400">2x&sup2; - 8 = 0</p>
+              <p class="mt-1 text-xs text-gray-500">Find the positive value of x</p>
+            </div>
+            ${PinInput({
+              ns: "safe-override",
+              length: 1,
+              hint: s.overrideError ? "Wrong answer! Try again." : "Enter the positive value of x",
+              onSubmit: (value) => SafeRoom.handleOverrideSubmit(value),
+            })}
+          </div>
+        </div>`
+            : ""
+        }
+      </div>
+    `;
+    refreshIcons();
+  },
+
+  openLaser() {
+    this.state.showLaser = true;
+    this.render();
+  },
+  closeLaser() {
+    this.state.showLaser = false;
+    this.render();
+  },
+
+  openComputer() {
+    if (!this.state.laserSolved) return;
+    this.state.showComputer = true;
+    if (!this.state.alarmActive && !this.state.alarmSolved) {
+      this.triggerAlarm();
+    }
+    this.render();
+  },
+  closeComputer() {
+    this.state.showComputer = false;
+    this.render();
+  },
+
+  handleMove(move) {
+    const s = this.state;
+    if (s.laserSolved) return;
+    const newPos = this.applyMove(s.playerPos, move);
+    const newSeq = [...s.moveSequence, move];
+    s.playerPos = newPos;
+    s.moveSequence = newSeq;
+
+    const matchesSoFar = newSeq.every((m, i) => m === SAFE_CONFIG.CORRECT_PATH[i]);
+
+    if (!matchesSoFar) {
+      s.laserError = true;
+      this.render();
+      const t = setTimeout(() => {
+        s.playerPos = { row: 0, col: 0 };
+        s.moveSequence = [];
+        s.laserError = false;
+        this.render();
+      }, 1000);
+      this.timeouts.push(t);
+      return;
+    }
+
+    if (newSeq.length === SAFE_CONFIG.CORRECT_PATH.length) {
+      s.laserSolved = true;
+    }
+    this.render();
+  },
+
+  triggerAlarm() {
+    const s = this.state;
+    s.alarmActive = true;
+    s.alarmTimeLeft = 30;
+    s.showAlarm = true;
+    this.startAlarmTimer();
+  },
+
+  handleAlarmSubmit(value) {
+    const s = this.state;
+    if (value === SAFE_CONFIG.ALARM_ANSWER) {
+      s.alarmSolved = true;
+      s.alarmActive = false;
+      s.showAlarm = false;
+      s.alarmError = false;
+      this.stopAlarmTimer();
+      this.render();
+    } else {
+      s.alarmError = true;
+      this.render();
+      const t = setTimeout(() => {
+        s.alarmError = false;
+        this.render();
+      }, 1500);
+      this.timeouts.push(t);
+    }
+  },
+
+  handleOverrideSubmit(value) {
+    const s = this.state;
+    if (value === SAFE_CONFIG.OVERRIDE_ANSWER) {
+      s.alarmSolved = true;
+      s.alarmActive = false;
+      s.showOverride = false;
+      s.showAlarm = false;
+      s.overrideError = false;
+      this.stopAlarmTimer();
+      this.render();
+    } else {
+      s.overrideError = true;
+      this.render();
+      const t = setTimeout(() => {
+        s.overrideError = false;
+        this.render();
+      }, 1500);
+      this.timeouts.push(t);
+    }
+  },
+
+  handleVaultSubmit(value) {
+    const s = this.state;
+    if (value === SAFE_CONFIG.VAULT_CODE) {
+      s.vaultUnlocked = true;
+      s.vaultError = false;
+      this.render();
+    } else {
+      s.vaultError = true;
+      this.render();
+      const t = setTimeout(() => {
+        s.vaultError = false;
+        this.render();
+      }, 1500);
+      this.timeouts.push(t);
+    }
+  },
+
+  handleProceed() {
+    Game.addClue({
+      room: "safe",
+      label: "Safe Room Clue",
+      value: SAFE_CONFIG.ALARM_ANSWER,
+      description: "The alarm answer (x from 4x + 3 = 19)",
+    });
+    Game.completeRoom("safe");
+    Game.goTo("vault");
+  },
+};
+
+/* ---------------------------------------------------------------------
+ * VaultRoom (mirrors src/screens/VaultRoom.tsx)
+ * ------------------------------------------------------------------- */
+const VaultRoom = {
+  mount(container) {
+    this.container = container;
+    this.state = {
+      collected: new Set(),
+      showPuzzle: false,
+      arrangement: [],
+      puzzleError: false,
+      solved: false,
+    };
+    this.timeouts = [];
+    this.render();
+    return () => {
+      this.timeouts.forEach((t) => clearTimeout(t));
+      this.timeouts = [];
+    };
+  },
+
+  render() {
+    const s = this.state;
+    const C = VAULT_CONFIG;
+    const allCollected = s.collected.size === C.SYMBOLS.length;
+
+    this.container.innerHTML = `
+      <div class="relative min-h-screen bg-gray-950 px-4 py-6 sm:px-8">
+        ${RoomBackground({
+          image: "https://images.pexels.com/photos/23322329/pexels-photo-23322329.jpeg?auto=compress&cs=tinysrgb&h=650&w=940",
+          overlay: "from-gray-950/95 via-gray-950/75 to-gray-950/95",
+        })}
+        <div class="pointer-events-none absolute left-1/2 top-1/2 h-[600px] w-[600px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-amber-500/10 blur-[120px]"></div>
+
+        ${RoomHeader({ title: "The Vault", subtitle: "The final room. Collect symbols and solve the logic puzzle to crack the vault." })}
+
+        <div class="relative z-10 mx-auto max-w-4xl">
+          <div class="mb-8">
+            <h3 class="mb-4 text-sm font-bold uppercase tracking-wide text-amber-400">Collect Symbols (${s.collected.size}/${C.SYMBOLS.length})</h3>
+            <div class="grid grid-cols-2 gap-4 sm:grid-cols-5">
+              ${C.SYMBOLS.map((sym) => {
+                const isCollected = s.collected.has(sym.id);
+                return `
+                <button onclick="VaultRoom.collectSymbol('${sym.id}')" ${isCollected ? "disabled" : ""} class="group relative flex flex-col items-center justify-center overflow-hidden rounded-xl border p-6 shadow-lg transition-all ${
+                  isCollected
+                    ? "border-green-500/50 bg-green-500/10"
+                    : "border-gray-700 bg-gradient-to-br from-gray-800 to-gray-900 hover:scale-105 hover:border-amber-500/50"
+                }">
+                  ${
+                    !isCollected
+                      ? `<img src="https://images.pexels.com/photos/8442330/pexels-photo-8442330.jpeg?auto=compress&cs=tinysrgb&h=650&w=940" alt="" class="absolute inset-0 h-full w-full object-cover opacity-20 transition-opacity group-hover:opacity-30" />`
+                      : ""
+                  }
+                  ${isCollected ? icon("check-circle-2", "relative z-10 mb-2 h-10 w-10 text-green-500") : icon(sym.iconName, "relative z-10 mb-2 h-10 w-10 text-gray-500 group-hover:text-amber-400")}
+                  <span class="relative z-10 text-xs font-semibold text-gray-300">${sym.name}</span>
+                  ${
+                    isCollected
+                      ? `<span class="relative z-10 mt-1 font-mono text-lg font-bold text-amber-400">${sym.value}</span>`
+                      : `<span class="relative z-10 mt-1 text-xs text-gray-500">${sym.sides}</span>`
+                  }
+                </button>`;
+              }).join("")}
+            </div>
+          </div>
+
+          ${
+            allCollected && !s.solved
+              ? `
+          <div class="flex justify-center">
+            <button onclick="VaultRoom.openPuzzle()" class="flex items-center gap-3 rounded-xl border border-amber-500 bg-amber-500/10 px-8 py-4 font-bold text-amber-400 transition-all hover:bg-amber-500/20">
+              ${icon("lock", "h-5 w-5")}
+              Solve the Logic Puzzle
+            </button>
+          </div>`
+              : ""
+          }
+
+          <div class="mt-6 space-y-3">
+            ${
+              !allCollected
+                ? `<div class="flex items-center gap-2 rounded-lg border border-gray-800 bg-gray-900/50 px-4 py-3 text-sm text-gray-500">${icon("sparkles", "h-4 w-4")}Collect all 5 symbols. Each shape's number of sides tells you its value.</div>`
+                : ""
+            }
+          </div>
+
+          ${
+            s.solved
+              ? `
+          <div class="mt-8 flex flex-col items-center gap-6">
+            <div class="flex h-24 w-24 items-center justify-center rounded-full border-2 border-amber-500 bg-amber-500/10 shadow-[0_0_40px_rgba(245,158,11,0.3)]">
+              ${icon("trophy", "h-12 w-12 text-amber-400")}
+            </div>
+            <h2 class="font-serif text-3xl font-bold text-amber-400">VAULT CRACKED</h2>
+            <p class="text-center text-gray-400">The vault door swings open. You've completed the heist!</p>
+            <button onclick="Game.finishGame()" class="group flex items-center gap-3 rounded-xl border border-amber-500 bg-amber-500/10 px-8 py-4 font-bold text-amber-400 transition-all hover:bg-amber-500 hover:text-gray-950 hover:shadow-[0_0_30px_rgba(245,158,11,0.4)]">
+              Claim Your Prize
+              ${icon("arrow-right", "h-5 w-5 transition-transform group-hover:translate-x-1")}
+            </button>
+          </div>`
+              : ""
+          }
+        </div>
+
+        ${
+          s.showPuzzle
+            ? `
+        <div class="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm" onclick="${s.solved ? "" : "VaultRoom.closePuzzle()"}">
+          <div class="relative w-full max-w-2xl rounded-2xl border border-amber-500/30 bg-gray-900 p-6 shadow-2xl" onclick="event.stopPropagation()">
+            <button onclick="VaultRoom.closePuzzle()" class="absolute right-4 top-4 text-gray-500 hover:text-amber-400">${icon("x", "h-5 w-5")}</button>
+            <h2 class="mb-4 font-serif text-xl font-bold text-amber-400">Vault Logic Puzzle</h2>
+            ${
+              s.solved
+                ? `
+              <div class="space-y-4 text-center">
+                ${icon("check-circle-2", "mx-auto h-16 w-16 text-green-500")}
+                <p class="text-gray-300">The correct order is: ${C.CORRECT_ORDER.join(" &rarr; ")}</p>
+                <p class="text-sm text-amber-400">The vault is unlocked!</p>
+              </div>`
+                : `
+              <div class="space-y-4">
+                <div class="rounded-lg border border-gray-800 bg-gray-950 p-4">
+                  <p class="mb-2 text-sm font-bold text-gray-300">Clues:</p>
+                  <ul class="space-y-1">
+                    ${C.CLUES.map((clue, i) => `<li class="text-sm text-gray-400">${i + 1}. ${clue}</li>`).join("")}
+                  </ul>
+                </div>
+
+                <div>
+                  <p class="mb-2 text-sm font-bold text-gray-300">Arrange the numbers in order:</p>
+                  <div class="flex justify-center gap-2">
+                    ${Array.from({ length: 5 })
+                      .map((_, i) => {
+                        const hasVal = s.arrangement[i] !== undefined;
+                        const cls = hasVal
+                          ? s.puzzleError
+                            ? "border-red-500 bg-red-500/20 text-red-400"
+                            : "border-amber-500 bg-amber-500/10 text-amber-400"
+                          : "border-gray-700 bg-gray-800 text-gray-600";
+                        return `<button onclick="VaultRoom.removeFromArrangement(${i})" class="flex h-14 w-14 items-center justify-center rounded-lg border-2 font-mono text-2xl font-bold transition-all ${cls}">${
+                          hasVal ? s.arrangement[i] : "&bull;"
+                        }</button>`;
+                      })
+                      .join("")}
+                  </div>
+                </div>
+
+                <div>
+                  <p class="mb-2 text-sm font-bold text-gray-300">Available numbers (click to add):</p>
+                  <div class="flex justify-center gap-2">
+                    ${C.SYMBOLS.map((sym) => {
+                      const used = s.arrangement.includes(sym.value);
+                      return `<button onclick="VaultRoom.addToArrangement(${sym.value})" ${used ? "disabled" : ""} class="flex h-12 w-12 items-center justify-center rounded-lg border font-mono text-lg font-bold transition-all ${
+                        used
+                          ? "border-gray-800 bg-gray-800/50 text-gray-600 opacity-30"
+                          : "border-gray-700 bg-gray-800 text-gray-200 hover:border-amber-500 hover:text-amber-400"
+                      }">${sym.value}</button>`;
+                    }).join("")}
+                  </div>
+                </div>
+
+                ${s.puzzleError ? `<p class="text-center text-sm text-red-400">Incorrect order. Try again!</p>` : ""}
+
+                <button onclick="VaultRoom.checkArrangement()" ${s.arrangement.length !== 5 ? "disabled" : ""} class="w-full rounded-lg border py-3 font-bold transition-all ${
+                    s.arrangement.length === 5
+                      ? "border-amber-500 bg-amber-500/20 text-amber-400 hover:bg-amber-500/30"
+                      : "cursor-not-allowed border-gray-800 bg-gray-800/50 text-gray-600"
+                  }">Submit Order</button>
+              </div>`
+            }
+          </div>
+        </div>`
+            : ""
+        }
+      </div>
+    `;
+    refreshIcons();
+  },
+
+  collectSymbol(id) {
+    this.state.collected = new Set(this.state.collected).add(id);
+    this.render();
+  },
+
+  openPuzzle() {
+    this.state.showPuzzle = true;
+    this.render();
+  },
+  closePuzzle() {
+    this.state.showPuzzle = false;
+    this.render();
+  },
+
+  addToArrangement(value) {
+    const s = this.state;
+    if (s.arrangement.includes(value)) return;
+    if (s.arrangement.length >= 5) return;
+    s.arrangement = [...s.arrangement, value];
+    this.render();
+  },
+
+  removeFromArrangement(index) {
+    const s = this.state;
+    if (s.arrangement[index] === undefined) return;
+    s.arrangement = s.arrangement.filter((_, i) => i !== index);
+    this.render();
+  },
+
+  checkArrangement() {
+    const s = this.state;
+    const C = VAULT_CONFIG;
+    if (s.arrangement.length === 5 && s.arrangement.every((v, i) => v === C.CORRECT_ORDER[i])) {
+      s.solved = true;
+      s.puzzleError = false;
+      Game.addClue({
+        room: "vault",
+        label: "Vault Clue",
+        value: "5",
+        description: "Final digit from the vault logic puzzle",
+      });
+      Game.completeRoom("vault");
+      this.render();
+    } else {
+      s.puzzleError = true;
+      this.render();
+      const t = setTimeout(() => {
+        s.puzzleError = false;
+        this.render();
+      }, 1500);
+      this.timeouts.push(t);
+    }
+  },
+};
+
+/* ---------------------------------------------------------------------
+ * VictoryScreen (mirrors src/screens/VictoryScreen.tsx)
+ * Uses /api/leaderboard instead of Supabase.
+ * ------------------------------------------------------------------- */
+const VictoryScreen = {
+  mount(container) {
+    this.container = container;
+    this.state = {
+      playerName: "",
+      submitted: false,
+      submitting: false,
+      error: false,
+      topEntries: [],
+    };
+    this.render();
+    return () => {};
+  },
+
+  render() {
+    const s = this.state;
+    const elapsed = Game.getElapsedSeconds();
+
+    this.container.innerHTML = `
+      <div class="relative min-h-screen overflow-hidden bg-gray-950">
+        <div class="absolute left-1/2 top-1/2 h-[600px] w-[600px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-amber-500/15 blur-[120px]"></div>
+
+        <div class="relative z-10 flex min-h-screen flex-col items-center justify-center px-4 py-12">
+          <div class="flex h-24 w-24 items-center justify-center rounded-full border-2 border-amber-500 bg-amber-500/10 shadow-[0_0_40px_rgba(245,158,11,0.3)]">
+            ${icon("trophy", "h-12 w-12 text-amber-400")}
+          </div>
+
+          <h1 class="mt-6 font-serif text-4xl font-bold text-amber-400 sm:text-5xl">HEIST COMPLETE</h1>
+          <p class="mt-2 text-sm uppercase tracking-[0.3em] text-gray-500">You cracked the vault</p>
+
+          <div class="mt-8 flex items-center gap-3 rounded-xl border border-amber-500/30 bg-gray-900 px-8 py-4">
+            ${icon("clock", "h-6 w-6 text-amber-400")}
+            <span class="font-mono text-4xl font-bold tabular-nums text-amber-400">${formatTime(elapsed)}</span>
+          </div>
+
+          ${
+            !s.submitted
+              ? `
+          <div class="mt-8 w-full max-w-md">
+            <p class="mb-4 text-center text-gray-400">Enter your name to record your time on the leaderboard:</p>
+            <input id="victory-name-input" type="text" value="${escapeHtml(s.playerName)}"
+              oninput="VictoryScreen.onNameInput(this.value)"
+              onkeydown="if(event.key==='Enter'){VictoryScreen.handleSubmit();}"
+              placeholder="Your name" maxlength="30"
+              class="w-full rounded-lg border border-gray-700 bg-gray-800 px-4 py-3 text-center text-gray-200 outline-none transition-colors focus:border-amber-500" />
+            ${s.error ? `<p class="mt-2 text-center text-sm text-red-400">Could not submit. Please try again.</p>` : ""}
+            <button onclick="VictoryScreen.handleSubmit()" ${!s.playerName.trim() || s.submitting ? "disabled" : ""} class="mt-4 w-full rounded-lg border py-3 font-bold transition-all ${
+                  s.playerName.trim() && !s.submitting
+                    ? "border-amber-500 bg-amber-500/20 text-amber-400 hover:bg-amber-500/30"
+                    : "cursor-not-allowed border-gray-800 bg-gray-800/50 text-gray-600"
+                }">${s.submitting ? "Submitting..." : "Submit My Time"}</button>
+          </div>`
+              : `
+          <div class="mt-8 w-full max-w-md">
+            <div class="mb-4 flex items-center justify-center gap-2 text-green-400">
+              ${icon("check-circle-2", "h-5 w-5")}
+              <span class="text-sm">Time recorded!</span>
+            </div>
+            <div class="rounded-xl border border-amber-500/20 bg-gray-900 p-4">
+              <h3 class="mb-3 flex items-center gap-2 text-sm font-bold uppercase tracking-wide text-amber-400">
+                ${icon("medal", "h-4 w-4")}
+                Top 10 Times
+              </h3>
+              <div class="space-y-2">
+                ${s.topEntries
+                  .map((entry, i) => {
+                    const isYou = entry.player_name === s.playerName.trim() && entry.completion_time_seconds === elapsed;
+                    const rowCls = isYou
+                      ? "border border-amber-500/50 bg-amber-500/10"
+                      : i === 0
+                      ? "bg-amber-500/5"
+                      : "bg-gray-800/50";
+                    const badgeCls =
+                      i === 0
+                        ? "bg-amber-500 text-gray-950"
+                        : i === 1
+                        ? "bg-gray-400 text-gray-950"
+                        : i === 2
+                        ? "bg-amber-700 text-gray-950"
+                        : "bg-gray-700 text-gray-300";
+                    return `
+                    <div class="flex items-center justify-between rounded-lg px-3 py-2 ${rowCls}">
+                      <span class="flex items-center gap-3">
+                        <span class="flex h-7 w-7 items-center justify-center rounded-full text-xs font-bold ${badgeCls}">${i + 1}</span>
+                        <span class="text-sm text-gray-200">${escapeHtml(entry.player_name)}</span>
+                      </span>
+                      <span class="font-mono text-sm font-bold tabular-nums text-amber-400">${formatTime(entry.completion_time_seconds)}</span>
+                    </div>`;
+                  })
+                  .join("")}
+              </div>
+            </div>
+          </div>`
+          }
+
+          <div class="mt-8 flex gap-4">
+            <button onclick="Game.resetGame()" class="flex items-center gap-2 rounded-xl border border-gray-700 bg-gray-800 px-6 py-3 font-bold text-gray-300 transition-all hover:border-amber-500 hover:text-amber-400">
+              ${icon("rotate-ccw", "h-4 w-4")}
+              Play Again
+            </button>
+            <button onclick="Game.goTo('start')" class="flex items-center gap-2 rounded-xl border border-gray-700 bg-gray-800 px-6 py-3 font-bold text-gray-300 transition-all hover:border-amber-500 hover:text-amber-400">
+              ${icon("home", "h-4 w-4")}
+              Home
+            </button>
+          </div>
+        </div>
+      </div>
+    `;
+    refreshIcons();
+    const nameInput = document.getElementById("victory-name-input");
+    if (nameInput) {
+      nameInput.focus();
+      nameInput.setSelectionRange(nameInput.value.length, nameInput.value.length);
+    }
+  },
+
+  onNameInput(value) {
+    this.state.playerName = value;
+  },
+
+  async handleSubmit() {
+    const s = this.state;
+    if (!s.playerName.trim()) return;
+    s.submitting = true;
+    s.error = false;
+    this.render();
+
+    const elapsed = Game.getElapsedSeconds();
+
+    try {
+      const res = await fetch("/api/leaderboard", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          player_name: s.playerName.trim(),
+          completion_time_seconds: elapsed,
+        }),
+      });
+      if (!res.ok) throw new Error("request failed");
+      const data = await res.json();
+      s.topEntries = data.top || [];
+      s.submitted = true;
+    } catch (e) {
+      s.error = true;
+    } finally {
+      s.submitting = false;
+      this.render();
+    }
+  },
+};
+
+/* ---------------------------------------------------------------------
+ * LeaderboardScreen (mirrors src/screens/LeaderboardScreen.tsx)
+ * Uses /api/leaderboard instead of Supabase.
+ * ------------------------------------------------------------------- */
+const LeaderboardScreen = {
+  mount(container) {
+    this.container = container;
+    this.state = {
+      entries: [],
+      loading: true,
+      error: false,
+      averageTime: 0,
+      totalPlayers: 0,
+    };
+    this.render();
+    this.fetchData();
+    return () => {};
+  },
+
+  async fetchData() {
+    const s = this.state;
+    try {
+      const res = await fetch("/api/leaderboard");
+      if (!res.ok) throw new Error("request failed");
+      const data = await res.json();
+      s.entries = data.top || [];
+      s.averageTime = data.average_time || 0;
+      s.totalPlayers = data.total_players || 0;
+    } catch (e) {
+      s.error = true;
+    } finally {
+      s.loading = false;
+      this.render();
+    }
+  },
+
+  render() {
+    const s = this.state;
+
+    let bodyHtml;
+    if (s.loading) {
+      bodyHtml = `<div class="p-8 text-center text-gray-500">Loading leaderboard...</div>`;
+    } else if (s.error) {
+      bodyHtml = `<div class="p-8 text-center text-red-400">Could not load leaderboard data.</div>`;
+    } else if (s.entries.length === 0) {
+      bodyHtml = `<div class="p-8 text-center text-gray-500">No times recorded yet. Be the first to complete the heist!</div>`;
+    } else {
+      bodyHtml = `
+        <div class="divide-y divide-gray-800">
+          <div class="flex items-center px-4 py-2 text-xs font-bold uppercase tracking-wide text-gray-500">
+            <span class="w-12">Rank</span>
+            <span class="flex-1">Player</span>
+            <span class="w-32 text-right">Time</span>
+            <span class="hidden w-32 text-right sm:block">Date</span>
+          </div>
+          ${s.entries
+            .map((entry, i) => {
+              const badgeCls =
+                i === 0
+                  ? "bg-amber-500 text-gray-950"
+                  : i === 1
+                  ? "bg-gray-400 text-gray-950"
+                  : i === 2
+                  ? "bg-amber-700 text-gray-950"
+                  : "bg-gray-700 text-gray-300";
+              const dateStr = entry.created_at ? new Date(entry.created_at).toLocaleDateString() : "";
+              return `
+              <div class="flex items-center px-4 py-3 transition-colors hover:bg-gray-800/30 ${i === 0 ? "bg-amber-500/5" : ""}">
+                <span class="w-12"><span class="flex h-8 w-8 items-center justify-center rounded-full text-xs font-bold ${badgeCls}">${i + 1}</span></span>
+                <span class="flex-1 font-semibold text-gray-200">${escapeHtml(entry.player_name)}</span>
+                <span class="w-32 text-right font-mono font-bold tabular-nums text-amber-400">${formatTime(entry.completion_time_seconds)}</span>
+                <span class="hidden w-32 text-right text-xs text-gray-500 sm:block">${dateStr}</span>
+              </div>`;
+            })
+            .join("")}
+        </div>`;
+    }
+
+    this.container.innerHTML = `
+      <div class="relative min-h-screen overflow-hidden bg-gray-950">
+        <div class="absolute left-1/2 top-0 h-[400px] w-[600px] -translate-x-1/2 rounded-full bg-amber-500/10 blur-[100px]"></div>
+
+        <div class="relative z-10 mx-auto max-w-3xl px-4 py-12">
+          <div class="mb-8 flex items-center justify-between">
+            <div class="flex items-center gap-3">
+              <div class="flex h-12 w-12 items-center justify-center rounded-xl border border-amber-500/40 bg-amber-500/10">
+                ${icon("trophy", "h-6 w-6 text-amber-400")}
+              </div>
+              <div>
+                <h1 class="font-serif text-3xl font-bold text-amber-400">Leaderboard</h1>
+                <p class="text-sm text-gray-500">Master Access &mdash; Top 10 Fastest Heists</p>
+              </div>
+            </div>
+            <button onclick="Game.goTo('start')" class="flex items-center gap-2 rounded-lg border border-gray-700 bg-gray-800 px-4 py-2 text-sm text-gray-300 transition-all hover:border-amber-500 hover:text-amber-400">
+              ${icon("home", "h-4 w-4")}
+              Home
+            </button>
+          </div>
+
+          <div class="mb-8 grid grid-cols-2 gap-4">
+            <div class="rounded-xl border border-gray-800 bg-gray-900 p-5">
+              <div class="mb-2 flex items-center gap-2 text-xs font-bold uppercase tracking-wide text-gray-500">
+                ${icon("bar-chart-3", "h-4 w-4")}
+                Average Time
+              </div>
+              <div class="flex items-center gap-2">
+                ${icon("clock", "h-6 w-6 text-amber-400")}
+                <span class="font-mono text-3xl font-bold tabular-nums text-amber-400">${formatTime(s.averageTime)}</span>
+              </div>
+            </div>
+            <div class="rounded-xl border border-gray-800 bg-gray-900 p-5">
+              <div class="mb-2 flex items-center gap-2 text-xs font-bold uppercase tracking-wide text-gray-500">
+                ${icon("medal", "h-4 w-4")}
+                Total Players
+              </div>
+              <div class="flex items-center gap-2">
+                <span class="font-mono text-3xl font-bold tabular-nums text-gray-200">${s.totalPlayers}</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="rounded-xl border border-gray-800 bg-gray-900 overflow-hidden">
+            <div class="border-b border-gray-800 bg-gray-800/50 px-4 py-3">
+              <h2 class="flex items-center gap-2 text-sm font-bold uppercase tracking-wide text-amber-400">
+                ${icon("trophy", "h-4 w-4")}
+                Top 10 Fastest Escapes
+              </h2>
+            </div>
+            ${bodyHtml}
+          </div>
+
+          <div class="mt-8 flex justify-center">
+            <button onclick="Game.goTo('start')" class="flex items-center gap-2 rounded-xl border border-amber-500 bg-amber-500/10 px-8 py-3 font-bold text-amber-400 transition-all hover:bg-amber-500/20">
+              ${icon("home", "h-4 w-4")}
+              Back to Start
+            </button>
+          </div>
+        </div>
+      </div>
+    `;
+    refreshIcons();
+  },
+};
+
+/* ---------------------------------------------------------------------
+ * Boot
+ * ------------------------------------------------------------------- */
+document.addEventListener("DOMContentLoaded", () => {
+  Router.render();
+});
+
+    </script>
+  </body>
+</html>
